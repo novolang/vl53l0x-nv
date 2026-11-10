@@ -25,15 +25,16 @@ on an I2C bus.
 - A cycle of the XSHUT pin, a change of the I2C address, GPIO1 and the data
   ready flag.
 - The device program `examples/range_reader.nv`, a distance reader. Built
-  for the nRF52840-DK it is 19,920 B of flash and for the nRF54LM20-DK
-  21,512 B.
+  for the nRF52840-DK it is 39,688 B of flash and for the nRF54LM20-DK
+  41,488 B; before the Nordic buses landed, with the reading path left out,
+  it was 19,920 B and 21,512 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board on the bench carries the
-  sensor. Neither Nordic board has a driver for its two-wire interface
-  (TWIM) at this release, so the device program builds for them and finds
-  an absent bus.
+  sensor. The nRF52840 DK drives I2C with TWIM0 and the nRF54LM20 DK with
+  TWIM22, so the device program's images carry the reading path; a reply from
+  the sensor over either bus is NOT VERIFIED.
 - ST publishes no register map. The sequences are those of ST's API as
   Pololu's `vl53l0x-arduino` and the `vl53l0x` Rust crate repeat them; the
   range status is ST's `VL53L0X_get_pal_range_status` less its three limit

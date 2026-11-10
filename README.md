@@ -110,8 +110,8 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 19,920 B | 7,040 B | 2,644 B |
-| `nrf54lm20-dk` | 21,512 B | 7,626 B | 2,644 B |
+| `nrf52840-dk` | 39,688 B | 23,102 B | 3,236 B |
+| `nrf54lm20-dk` | 41,488 B | 23,874 B | 3,236 B |
 
 The numbers are from the build's memory report. Flash also holds the
 runtime, the compiler's support library and the program's tables; the
@@ -121,11 +121,16 @@ runtime's heap and is reserved whether or not the program uses it; the
 driver allocates nothing in it. The whole of the driver's state is a
 `Vl53l0x` value of 112 bytes in the program's frame.
 
-Neither Nordic board package names a driver for its two-wire interface
-(`@hal(i2c)`), so `BoardI2c` is absent hardware on both: every transfer is
-refused, the program prints `no answer from the sensor at 0x29`, and the
-build removes the code that follows the first bus read, which makes the
-rows above smaller than the image of a board with a bus.
+The Nordic DKs drive I2C with a TWIM (the nRF52840 DK's TWIM0 on SDA P0.26
+and SCL P0.27, the nRF54LM20 DK's TWIM22 on SDA P1.03 and SCL P1.04), on the
+pins `docs/hal/README.md` names under "The Nordic DKs' buses", so both rows
+are the image with the driver's reading path in it.  Before the Nordic buses
+landed the two rows were 19,920 and 21,512 bytes of flash, of which the
+program was 7,040 and 7,626 bytes: the board packages answered for I2C as
+absent hardware, and the build removed the code that follows the first bus
+read.  Under QEMU the emulated board still has no bus, so its image prints
+`no answer from the sensor at 0x29`.  A reply from the sensor over a DK's
+bus is NOT VERIFIED until the driver rig carries one.
 
 The wiring: SDA and SCL to the board's first I2C bus, the breakout's
 supply to 3.3 V, and its XSHUT and GPIO1 pins either open (the breakouts
