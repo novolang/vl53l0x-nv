@@ -42,9 +42,7 @@ on an I2C bus.
   SPAD calibration (the factory's SPAD values are applied), the sigma,
   reference-clip and range-ignore-threshold checks, the interrupt
   thresholds, fractional ranging and the linearity corrective gain.
-- `devices-nv` is a path dependency (`../devices-nv`, 0.3.3), which has the
-  `Rangefinder` trait and is not on the registry yet. `embedded-hal-nv` is
-  the registry's 0.3.2, because a path copy of it conflicts with the
-  registry requirement of devices-nv.
+- `devices-nv` is the registry range `^0.3.3`, the first release with the
+  `Rangefinder` trait. `embedded-hal-nv` is the registry range `^0.3.2`.
 - The `[tier]` of the manifest is `embedded`, the strictest, so the module
   also checks at `rt` and `system`.
