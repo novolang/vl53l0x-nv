@@ -1,0 +1,28 @@
+[package]
+name        = "vl53l0x-nv"
+version     = "0.1.0"
+description = "A driver for ST's VL53L0X time-of-flight ranging sensor on an I2C bus: the initialisation sequence with its tuning table and reference calibration, the timing budget, the signal-rate limit and the VCSEL pulse periods, single and continuous ranging, the range in millimetres with ST's range status, and the long-range, high-accuracy and high-speed profiles, as devices-nv's Rangefinder and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["vl53l0x", "time-of-flight", "tof", "rangefinder", "distance", "lidar", "i2c", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/vl53l0x-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# The package is checked at the embedded tier, the strictest one, so
+# every function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading a VL53L0X time-of-flight sensor from a device program"
+
+[dependencies]
+# The board's I2C bus, GPIO and timer handles, and the I2cBus, GpioOut
+# and Timer traits they implement.
+embedded-hal-nv = "^0.3.2"
+# The Rangefinder and Identifiable traits, the wiring record a board's
+# device table hands `attach`, and the register helpers.
+devices-nv      = { path = "../devices-nv" }

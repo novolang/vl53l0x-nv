@@ -1,0 +1,1042 @@
+// vl53l0x — ST's VL53L0X time-of-flight ranging sensor, on its I2C bus,
+// as devices-nv's `Rangefinder` and `Identifiable`.
+//
+// ST publishes no register map for the part.  The datasheet, "VL53L0X:
+// World smallest Time-of-Flight ranging and gesture detection sensor",
+// DocID029104 Rev 2 (April 2018, ST's DS11555), gives the I2C address
+// (0x52 in write form, so 0x29), the boot time (1.2 ms), XSHUT, GPIO1 and
+// the reference registers 0xC0 = 0xEE, 0xC1 = 0xAA, 0xC2 = 0x10 (Table 4);
+// the API user manual UM2039 Rev 1 (June 2016) gives the range status
+// (Table 1), the timing budget and the four example profiles (Table 6).
+// The rest, the initialisation sequence, the tuning register writes and the
+// timing arithmetic, is ST's API (STSW-IMG005) as the open drivers repeat
+// it, and this file's sequence is theirs in order and value:
+//
+//   - Pololu's `vl53l0x-arduino` (MIT), whose comments quote the API;
+//   - the `vl53l0x` Rust crate (copterust);
+//   - ST's own VL53L0X_get_pal_range_status, in the copy that
+//     stm32duino/VL53L0X carries, for the range status.
+//
+// Nothing is ported: the code below is written from the sequences, and
+// the registers that carry no name in the sheet are named for what the
+// API calls them.  Where a driver read for this one differs, the site
+// says what was taken.
+//
+// The register map as this driver uses it (8-bit addresses; 16- and 32-bit
+// values are most significant byte first, in ascending addresses, Table 5):
+//
+//   0x00  SYSRANGE_START               0x01 single, 0x02 back-to-back,
+//                                      0x04 timed, bit 6 VHV, 0x00 idle
+//   0x01  SYSTEM_SEQUENCE_CONFIG       TCC 4, DSS 3, MSRC 2, PRE_RANGE 6,
+//                                      FINAL_RANGE 7
+//   0x04  SYSTEM_INTERMEASUREMENT_PERIOD   32 bits, in oscillator ticks
+//   0x0A  SYSTEM_INTERRUPT_CONFIG_GPIO     0x04 is "new sample ready"
+//   0x0B  SYSTEM_INTERRUPT_CLEAR           write 0x01
+//   0x13  RESULT_INTERRUPT_STATUS          bits 2:0 non-zero when a result waits
+//   0x14  RESULT_RANGE_STATUS              12 bytes: status at bits 6:3 of the
+//                                          first, effective SPADs (8.8) at 2,
+//                                          signal rate (9.7 MCPS) at 6,
+//                                          ambient rate at 8, range in mm at 10
+//   0x44  FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT   16 bits, 9.7 MCPS
+//   0x46  MSRC_CONFIG_TIMEOUT_MACROP
+//   0x47/0x48  FINAL_RANGE_CONFIG_VALID_PHASE_LOW / _HIGH
+//   0x50  PRE_RANGE_CONFIG_VCSEL_PERIOD
+//   0x51  PRE_RANGE_CONFIG_TIMEOUT_MACROP  16 bits
+//   0x56/0x57  PRE_RANGE_CONFIG_VALID_PHASE_LOW / _HIGH
+//   0x60  MSRC_CONFIG_CONTROL
+//   0x70  FINAL_RANGE_CONFIG_VCSEL_PERIOD
+//   0x71  FINAL_RANGE_CONFIG_TIMEOUT_MACROP  16 bits
+//   0x84  GPIO_HV_MUX_ACTIVE_HIGH          bit 4: interrupt active high
+//   0x89  VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV  bit 0: 2.8 V I/O
+//   0x8A  I2C_SLAVE_DEVICE_ADDRESS
+//   0xB0..0xB5  GLOBAL_CONFIG_SPAD_ENABLES_REF   48 bits, one per SPAD
+//   0xC0  IDENTIFICATION_MODEL_ID      0xEE
+//   0xC2  IDENTIFICATION_REVISION_ID   0x10
+//   0xF8  OSC_CALIBRATE_VAL            16 bits
+//   0xFF  the page register; 0x80 powers the pages up
+//
+// What the driver does, in the order `start` does it (ST's VL53L0X_DataInit,
+// StaticInit and PerformRefCalibration):
+//
+//   1. the model ID check;
+//   2. the data initialisation: 2.8 V I/O, I2C standard mode, the stop
+//      variable, the limit checks off, the signal-rate limit at 0.25 MCPS;
+//   3. the static initialisation: the reference SPAD count and type read
+//      from the part's NVM and applied (the factory calibration of the
+//      reference SPADs), the tuning settings, the interrupt configuration,
+//      the timing budget re-applied with MSRC and TCC off;
+//   4. the reference calibration: VHV, then phase.
+//
+// Pitfalls the open drivers carry, and what is done here:
+//
+//   - Pololu's `init` leaves the page register at 0x07 when the SPAD
+//     handshake times out, so the next access hits another page.  Every
+//     page entered is left, on every path.
+//   - Both drivers read a register with no check of the transfer, so a
+//     part that does not answer reads as zeros.  Every transfer is checked.
+//   - Pololu's timeout is off by default, and a missing part hangs the
+//     program in the first wait.  Every wait here has a timeout.
+//   - Both drivers report the distance and drop the range status, so a
+//     reading of 8190 mm, which the part gives for "no target", is a
+//     distance.  The status is decoded with ST's table.
+//   - A result that was not read keeps the interrupt flag, and the next
+//     single-shot reads it as its own.  The flag is cleared before a
+//     measurement starts and after a result is read.
+//   - The stop variable that the part keeps at 0x91 is zeroed by the stop
+//     of continuous ranging and has to be written back to start the next
+//     measurement.  It is kept in the state the driver hands back.
+
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut, Timer }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_range.{ RangeReading, RangeStatus, Rangefinder }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let SYSRANGE_START = 0x00
+let SYSTEM_SEQUENCE_CONFIG = 0x01
+let SYSTEM_INTERMEASUREMENT_PERIOD = 0x04
+let SYSTEM_INTERRUPT_CONFIG_GPIO = 0x0A
+let SYSTEM_INTERRUPT_CLEAR = 0x0B
+let RESULT_INTERRUPT_STATUS = 0x13
+let RESULT_RANGE_STATUS = 0x14
+let FINAL_RANGE_MIN_COUNT_RATE = 0x44
+let MSRC_CONFIG_TIMEOUT_MACROP = 0x46
+let FINAL_RANGE_VALID_PHASE_LOW = 0x47
+let FINAL_RANGE_VALID_PHASE_HIGH = 0x48
+let PRE_RANGE_VCSEL_PERIOD = 0x50
+let PRE_RANGE_TIMEOUT_MACROP = 0x51
+let PRE_RANGE_VALID_PHASE_LOW = 0x56
+let PRE_RANGE_VALID_PHASE_HIGH = 0x57
+let MSRC_CONFIG_CONTROL = 0x60
+let FINAL_RANGE_VCSEL_PERIOD = 0x70
+let FINAL_RANGE_TIMEOUT_MACROP = 0x71
+let GPIO_HV_MUX_ACTIVE_HIGH = 0x84
+let VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV = 0x89
+let I2C_SLAVE_DEVICE_ADDRESS = 0x8A
+let SPAD_ENABLES_REF = 0xB0
+let GLOBAL_CONFIG_REF_EN_START_SELECT = 0xB6
+let GLOBAL_CONFIG_VCSEL_WIDTH = 0x32
+let ALGO_PHASECAL_CONFIG_TIMEOUT = 0x30
+let ALGO_PHASECAL_LIM = 0x30
+let DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD = 0x4E
+let DYNAMIC_SPAD_REF_EN_START_OFFSET = 0x4F
+let IDENTIFICATION_MODEL_ID = 0xC0
+let IDENTIFICATION_REVISION_ID = 0xC2
+let OSC_CALIBRATE_VAL = 0xF8
+let PAGE = 0xFF
+let POWER_PAGES = 0x80
+let STOP_VARIABLE = 0x91
+
+// The model ID of Table 4.
+let MODEL_ID = 0xEE
+
+// The start modes of SYSRANGE_START.
+let START_SINGLE = 0x01
+let START_BACK_TO_BACK = 0x02
+let START_TIMED = 0x04
+// The VHV calibration asks for bit 6 as well.
+let START_VHV = 0x40
+
+// The device-reported status codes in bits 6:3 of RESULT_RANGE_STATUS,
+// as ST's API names them.
+let CODE_VCSEL_CONTINUITY = 1
+let CODE_VCSEL_WATCHDOG = 2
+let CODE_NO_VHV = 3
+let CODE_MSRC_NO_TARGET = 4
+let CODE_RANGE_PHASE = 6
+let CODE_TCC = 8
+let CODE_PHASE_CONSISTENCY = 9
+let CODE_MIN_CLIP = 10
+let CODE_RANGE_COMPLETE = 11
+
+// What the part reports for a target beyond what it can range: 8190 and
+// 8191 mm.
+let OUT_OF_RANGE_MM = 8190
+
+// The bus clock, I2C fast mode (datasheet: 400 kbit/s), and the booting
+// time with margin (datasheet tBOOT 1.2 ms).
+let I2C_HZ = 400000
+let BOOT_MS = 2
+
+// How long the driver waits: for the SPAD handshake and a reference
+// calibration, in milliseconds; for a result, 1100 ms, which is longer
+// than the 1 s the largest timing budget the driver allows.
+let SPAD_WAIT_MS = 100
+let CAL_WAIT_MS = 100
+let RESULT_WAIT_MS = 1100
+
+// The default signal-rate limit, 0.25 MCPS, in thousandths of a MCPS
+// (the API's default for the final range); the register holds 9.7 fixed
+// point, so the limit is a multiple of 1/128 MCPS.
+let DEFAULT_LIMIT_MMCPS = 250
+let MAX_LIMIT_MMCPS = 511990
+
+// The timing budget: the default the API starts from is about 33 ms; the
+// least the sequence can run in is 20 ms (UM2039, "Overall timing budget");
+// the driver allows up to 1 s.
+let MIN_BUDGET_US = 20000
+let MAX_BUDGET_US = 1000000
+
+// The overheads the API adds to the steps of the sequence, in
+// microseconds.
+let START_OVERHEAD = 1910
+let END_OVERHEAD = 960
+let MSRC_OVERHEAD = 660
+let TCC_OVERHEAD = 590
+let DSS_OVERHEAD = 690
+let PRE_RANGE_OVERHEAD = 660
+let FINAL_RANGE_OVERHEAD = 550
+
+// The tuning settings, as the register and the value of each write, in the
+// order the API writes them (VL53L0X_load_tuning_settings, the
+// DefaultTuningSettings table of `vl53l0x_tuning.h`).  A write to 0xFF
+// selects a page of the register file.
+// The count of pairs in `TUNING`; a test checks it against the table.
+pub const TUNING_PAIRS = 80
+
+pub const TUNING = [
+    0xFF, 0x01, 0x00, 0x00,
+    0xFF, 0x00, 0x09, 0x00, 0x10, 0x00, 0x11, 0x00,
+    0x24, 0x01, 0x25, 0xFF, 0x75, 0x00,
+    0xFF, 0x01, 0x4E, 0x2C, 0x48, 0x00, 0x30, 0x20,
+    0xFF, 0x00, 0x30, 0x09, 0x54, 0x00, 0x31, 0x04, 0x32, 0x03, 0x40, 0x83, 0x46, 0x25,
+    0x60, 0x00, 0x27, 0x00, 0x50, 0x06, 0x51, 0x00, 0x52, 0x96, 0x56, 0x08, 0x57, 0x30,
+    0x61, 0x00, 0x62, 0x00, 0x64, 0x00, 0x65, 0x00, 0x66, 0xA0,
+    0xFF, 0x01, 0x22, 0x32, 0x47, 0x14, 0x49, 0xFF, 0x4A, 0x00,
+    0xFF, 0x00, 0x7A, 0x0A, 0x7B, 0x00, 0x78, 0x21,
+    0xFF, 0x01, 0x23, 0x34, 0x42, 0x00, 0x44, 0xFF, 0x45, 0x26, 0x46, 0x05, 0x40, 0x40,
+    0x0E, 0x06, 0x20, 0x1A, 0x43, 0x40,
+    0xFF, 0x00, 0x34, 0x03, 0x35, 0x44,
+    0xFF, 0x01, 0x31, 0x04, 0x4B, 0x09, 0x4C, 0x05, 0x4D, 0x04,
+    0xFF, 0x00, 0x44, 0x00, 0x45, 0x20, 0x47, 0x08, 0x48, 0x28, 0x67, 0x00, 0x70, 0x04,
+    0x71, 0x01, 0x72, 0xFE, 0x76, 0x00, 0x77, 0x00,
+    0xFF, 0x01, 0x0D, 0x01,
+    0xFF, 0x00, 0x80, 0x01, 0x01, 0xF8,
+    0xFF, 0x01, 0x8E, 0x01, 0x00, 0x01, 0xFF, 0x00, 0x80, 0x00
+]
+
+// The measurement profiles of UM2039, Table 6 and §§ 7.1 to 7.3.  The
+// default is the API's own; the other three change the signal-rate limit,
+// the timing budget and, for the long range, the VCSEL pulse periods.  The
+// manual's sigma limits (18, 60 and 32 mm) are not applied: the sigma
+// check is not implemented (see the README).
+pub @value
+enum Vl53Profile
+    Vl53Default
+    Vl53HighAccuracy
+    Vl53LongRange
+    Vl53HighSpeed
+
+// The state the driver hands back and takes: the stop variable that
+// `start` read from the part (0x91), and whether continuous ranging is
+// running.
+pub @value
+struct Vl53State
+    stop_var: Int
+    continuous: Bool
+
+// The sequence steps, their timeouts, and the VCSEL periods, as the API's
+// `SequenceStepEnables` and `SequenceStepTimeouts` hold them.
+@value
+struct Seq
+    tcc: Bool
+    dss: Bool
+    msrc: Bool
+    pre: Bool
+    fin: Bool
+    pre_pclks: Int
+    fin_pclks: Int
+    msrc_us: Int
+    pre_us: Int
+    fin_us: Int
+    pre_mclks: Int
+
+// A bus the part is on: `setup` makes it ready, `read_regs` and
+// `write_regs` move bytes from and to consecutive registers in one
+// transaction, `now_ms` and `wait_ms` are the clock, `irq_level` is the
+// level of GPIO1 and `xshut` drives the shutdown pin.
+pub trait Vl53l0xPort
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+    fn now_ms(self) -> Int [hw]
+    fn wait_ms(self, ms: Int) [hw]
+    fn irq_level(self) -> Int [hw]
+    fn xshut(self, level: Int) -> Bool [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+pub fn i2c_write_from<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Makes the bus ready: the interrupt pin an input, the shutdown pin an
+// output, the bus at 400 kHz.  Answers whether the wiring has an address.
+pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    if let Some(en) = w.en
+        gpio.mode(en, 1)
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// The level of GPIO1 on the board, or -1 for a wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// Drives the shutdown pin: whether the wiring has one.
+pub fn xshut_of<G: GpioOut>(gpio: G, w: DeviceWiring, level: Int) -> Bool [hw]
+    let Some(en) = w.en else return false
+    gpio.set(en, level)
+    true
+
+// ── Register access ──────────────────────────────────────────────────
+
+// One register, or `None` when the part did not answer.
+pub fn rd<P: Vl53l0xPort>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// A 16-bit value, most significant byte first.
+pub fn rd16<P: Vl53l0xPort>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 2, var b)
+        return None
+    Some((b[0] as Int << 8) | b[1] as Int)
+
+// Writes one register: whether the part acknowledged.
+pub fn wr<P: Vl53l0xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    p.write_regs(reg, src)
+
+// Writes a 16-bit value, most significant byte first.
+pub fn wr16<P: Vl53l0xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(((v >> 8) & 0xFF) as u8)
+    let _ = src.push((v & 0xFF) as u8)
+    p.write_regs(reg, src)
+
+// Writes a 32-bit value, most significant byte first.
+pub fn wr32<P: Vl53l0xPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(((v >> 24) & 0xFF) as u8)
+    let _ = src.push(((v >> 16) & 0xFF) as u8)
+    let _ = src.push(((v >> 8) & 0xFF) as u8)
+    let _ = src.push((v & 0xFF) as u8)
+    p.write_regs(reg, src)
+
+// Sets the bits of `mask` in `reg` to `bits`, leaving the others.
+pub fn upd<P: Vl53l0xPort>(p: P, reg: Int, mask: Int, bits: Int) -> Bool [hw]
+    let Some(old) = rd(p, reg) else return false
+    wr(p, reg, (old & (0xFF ^ mask)) | (bits & mask))
+
+// Polls `reg` until one of the bits of `mask` is set, for at most
+// `timeout_ms`: whether it was.  The register is read at least once.
+pub fn poll_set<P: Vl53l0xPort>(p: P, reg: Int, mask: Int, timeout_ms: Int) -> Bool [hw]
+    let start = p.now_ms()
+    loop
+        let Some(v) = rd(p, reg) else return false
+        if (v & mask) != 0
+            return true
+        if p.now_ms() - start >= timeout_ms
+            return false
+
+// The page that holds the stop variable and the tuning registers is
+// reached by this sequence (the API's "Set the page" writes): power the
+// pages up, select page 1, select the group 0.
+pub fn page_enter<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    wr(p, POWER_PAGES, 0x01) and wr(p, PAGE, 0x01) and wr(p, 0x00, 0x00)
+
+// And the way back, which is attempted whatever happened inside: the
+// register file is left on page 0 with the pages powered down.
+pub fn page_leave<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    wr(p, 0x00, 0x01) and wr(p, PAGE, 0x00) and wr(p, POWER_PAGES, 0x00)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// Whether the model ID register reads 0xEE.
+pub fn model_ok<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    rd(p, IDENTIFICATION_MODEL_ID) == Some(MODEL_ID)
+
+// The part's identity: the model ID and the revision register.
+pub fn id_read<P: Vl53l0xPort>(p: P) -> ?DeviceId [hw]
+    let Some(who) = rd(p, IDENTIFICATION_MODEL_ID) else return None
+    if who != MODEL_ID
+        return None
+    Some(DeviceId { who: who, rev: rd(p, IDENTIFICATION_REVISION_ID) })
+
+// ── Timeouts and periods: the API's arithmetic ───────────────────────
+
+// The VCSEL period in PCLKs for a register value, and back.
+pub fn vcsel_pclks_of(reg: Int) -> Int
+    (reg + 1) << 1
+
+pub fn vcsel_reg_of(pclks: Int) -> Int
+    (pclks >> 1) - 1
+
+// The macro period in nanoseconds for a VCSEL period in PCLKs: 2304
+// VCSEL clocks of 1.655 ns per PCLK, rounded.
+pub fn macro_period_ns(pclks: Int) -> Int
+    (2304 * pclks * 1655 + 500) / 1000
+
+// A timeout in macro periods for a count in microseconds, and back.
+pub fn mclks_to_us(mclks: Int, pclks: Int) -> Int
+    (mclks * macro_period_ns(pclks) + 500) / 1000
+
+pub fn us_to_mclks(us: Int, pclks: Int) -> Int
+    let ns = macro_period_ns(pclks)
+    (us * 1000 + ns / 2) / ns
+
+// A sequence-step timeout register: the API's "(LSByte * 2^MSByte) + 1".
+pub fn timeout_decode(reg: Int) -> Int
+    ((reg & 0xFF) << ((reg >> 8) & 0xFF)) + 1
+
+// The register value for a timeout in macro periods: the largest
+// least-significant byte that fits eight bits, the rest in the exponent.
+pub fn timeout_encode(mclks: Int) -> Int
+    if mclks <= 0
+        return 0
+    var ls = mclks - 1
+    var ms = 0
+    for _k in 0..24
+        if ls > 255
+            ls = ls >> 1
+            ms = ms + 1
+    (ms << 8) | (ls & 0xFF)
+
+// The sequence steps and their times as the part has them set.
+pub fn seq_read<P: Vl53l0xPort>(p: P) -> ?Seq [hw]
+    let Some(cfg) = rd(p, SYSTEM_SEQUENCE_CONFIG) else return None
+    let Some(pre_reg) = rd(p, PRE_RANGE_VCSEL_PERIOD) else return None
+    let Some(msrc_reg) = rd(p, MSRC_CONFIG_TIMEOUT_MACROP) else return None
+    let Some(pre_to) = rd16(p, PRE_RANGE_TIMEOUT_MACROP) else return None
+    let Some(fin_reg) = rd(p, FINAL_RANGE_VCSEL_PERIOD) else return None
+    let Some(fin_to) = rd16(p, FINAL_RANGE_TIMEOUT_MACROP) else return None
+    let pre_on = ((cfg >> 6) & 1) == 1
+    let pre_pclks = vcsel_pclks_of(pre_reg)
+    let fin_pclks = vcsel_pclks_of(fin_reg)
+    let pre_mclks = timeout_decode(pre_to)
+    var fin_mclks = timeout_decode(fin_to)
+    if pre_on
+        fin_mclks = fin_mclks - pre_mclks
+    Some(Seq {
+        tcc: ((cfg >> 4) & 1) == 1,
+        dss: ((cfg >> 3) & 1) == 1,
+        msrc: ((cfg >> 2) & 1) == 1,
+        pre: pre_on,
+        fin: ((cfg >> 7) & 1) == 1,
+        pre_pclks: pre_pclks,
+        fin_pclks: fin_pclks,
+        msrc_us: mclks_to_us(msrc_reg + 1, pre_pclks),
+        pre_us: mclks_to_us(pre_mclks, pre_pclks),
+        fin_us: mclks_to_us(fin_mclks, fin_pclks),
+        pre_mclks: pre_mclks
+    })
+
+// The time the enabled steps take besides the final range, in
+// microseconds: the start and end overheads and each step with its own.
+pub fn used_us(s: Seq) -> Int
+    var used = START_OVERHEAD + END_OVERHEAD
+    if s.tcc
+        used = used + s.msrc_us + TCC_OVERHEAD
+    if s.dss
+        used = used + 2 * (s.msrc_us + DSS_OVERHEAD)
+    elif s.msrc
+        used = used + s.msrc_us + MSRC_OVERHEAD
+    if s.pre
+        used = used + s.pre_us + PRE_RANGE_OVERHEAD
+    used
+
+// ── The timing budget ────────────────────────────────────────────────
+
+// The measurement timing budget in microseconds, from the steps the part
+// is set to.
+pub fn budget_read<P: Vl53l0xPort>(p: P) -> ?Int [hw]
+    let Some(s) = seq_read(p) else return None
+    var b = used_us(s)
+    if s.fin
+        b = b + s.fin_us + FINAL_RANGE_OVERHEAD
+    Some(b)
+
+// Sets the budget: the final range gets what the other steps leave.
+// Answers false when the budget is outside 20 ms to 1 s, when the other
+// steps need more than it, and when the part does not answer.
+pub fn budget_write<P: Vl53l0xPort>(p: P, budget_us: Int) -> Bool [hw]
+    if budget_us < MIN_BUDGET_US or budget_us > MAX_BUDGET_US
+        return false
+    let Some(s) = seq_read(p) else return false
+    if not s.fin
+        return true
+    let used = used_us(s) + FINAL_RANGE_OVERHEAD
+    if used > budget_us
+        return false
+    var mclks = us_to_mclks(budget_us - used, s.fin_pclks)
+    if s.pre
+        mclks = mclks + s.pre_mclks
+    wr16(p, FINAL_RANGE_TIMEOUT_MACROP, timeout_encode(mclks))
+
+// ── The signal-rate limit ────────────────────────────────────────────
+
+// The minimum return signal for a valid final range, in thousandths of a
+// million counts per second, from the 9.7 fixed-point register.
+pub fn limit_read<P: Vl53l0xPort>(p: P) -> ?Int [hw]
+    let Some(v) = rd16(p, FINAL_RANGE_MIN_COUNT_RATE) else return None
+    Some(v * 1000 / 128)
+
+// Sets the limit: a lower one reaches further and trusts weaker returns.
+// Answers false for a limit outside 0 to 511.99 MCPS.
+pub fn limit_write<P: Vl53l0xPort>(p: P, mmcps: Int) -> Bool [hw]
+    if mmcps < 0 or mmcps > MAX_LIMIT_MMCPS
+        return false
+    wr16(p, FINAL_RANGE_MIN_COUNT_RATE, mmcps * 128 / 1000)
+
+// ── The VCSEL pulse periods ──────────────────────────────────────────
+
+// The pre-range and final-range periods in PCLKs.
+pub fn vcsel_read<P: Vl53l0xPort>(p: P, final_range: Bool) -> ?Int [hw]
+    var reg = PRE_RANGE_VCSEL_PERIOD
+    if final_range
+        reg = FINAL_RANGE_VCSEL_PERIOD
+    let Some(v) = rd(p, reg) else return None
+    Some(vcsel_pclks_of(v))
+
+// The settings the API writes for a pre-range period: the upper phase
+// limit, or -1 for a period the part does not take (12, 14, 16, 18).
+pub fn pre_phase_high(pclks: Int) -> Int
+    if pclks == 12
+        return 0x18
+    if pclks == 14
+        return 0x30
+    if pclks == 16
+        return 0x40
+    if pclks == 18
+        return 0x50
+    -1
+
+// The final-range settings for a period of 8, 10, 12 or 14 PCLKs: the
+// upper phase limit (-1 for another period), the VCSEL width, the
+// phase-calibration timeout and its limit.
+pub fn final_phase_high(pclks: Int) -> Int
+    if pclks == 8
+        return 0x10
+    if pclks == 10
+        return 0x28
+    if pclks == 12
+        return 0x38
+    if pclks == 14
+        return 0x48
+    -1
+
+pub fn final_vcsel_width(pclks: Int) -> Int
+    if pclks == 8
+        return 0x02
+    3
+
+pub fn final_phasecal_timeout(pclks: Int) -> Int
+    if pclks == 8
+        return 0x0C
+    if pclks == 10
+        return 0x09
+    if pclks == 12
+        return 0x08
+    0x07
+
+pub fn final_phasecal_lim(pclks: Int) -> Int
+    if pclks == 8
+        return 0x30
+    0x20
+
+// Sets the pre-range period: 12, 14, 16 or 18 PCLKs.  The step timeouts
+// are rewritten in macro periods at the new period, as the API requires
+// ("the timeout must be read using the current period, then the new period
+// applied, and the timeout written back using it"), and the budget is
+// applied again.
+pub fn pre_period_write<P: Vl53l0xPort>(p: P, pclks: Int) -> Bool [hw]
+    let hi = pre_phase_high(pclks)
+    if hi < 0
+        return false
+    let Some(s) = seq_read(p) else return false
+    let Some(budget) = budget_read(p) else return false
+    let msrc_m = us_to_mclks(s.msrc_us, pclks)
+    var msrc_reg = msrc_m - 1
+    if msrc_m > 256
+        msrc_reg = 255
+    let ok = wr(p, PRE_RANGE_VALID_PHASE_HIGH, hi) and wr(p, PRE_RANGE_VALID_PHASE_LOW, 0x08) and wr(p, PRE_RANGE_VCSEL_PERIOD, vcsel_reg_of(pclks)) and wr16(p, PRE_RANGE_TIMEOUT_MACROP, timeout_encode(us_to_mclks(s.pre_us, pclks))) and wr(p, MSRC_CONFIG_TIMEOUT_MACROP, msrc_reg)
+    if not ok
+        return false
+    budget_write(p, budget) and phase_calibrate(p)
+
+// Sets the final-range period: 8, 10, 12 or 14 PCLKs.
+pub fn final_period_write<P: Vl53l0xPort>(p: P, pclks: Int) -> Bool [hw]
+    let hi = final_phase_high(pclks)
+    if hi < 0
+        return false
+    let Some(s) = seq_read(p) else return false
+    let Some(budget) = budget_read(p) else return false
+    var mclks = us_to_mclks(s.fin_us, pclks)
+    if s.pre
+        mclks = mclks + s.pre_mclks
+    let ok = wr(p, FINAL_RANGE_VALID_PHASE_HIGH, hi) and wr(p, FINAL_RANGE_VALID_PHASE_LOW, 0x08) and wr(p, GLOBAL_CONFIG_VCSEL_WIDTH, final_vcsel_width(pclks)) and wr(p, ALGO_PHASECAL_CONFIG_TIMEOUT, final_phasecal_timeout(pclks)) and wr(p, PAGE, 0x01) and wr(p, ALGO_PHASECAL_LIM, final_phasecal_lim(pclks)) and wr(p, PAGE, 0x00) and wr(p, FINAL_RANGE_VCSEL_PERIOD, vcsel_reg_of(pclks)) and wr16(p, FINAL_RANGE_TIMEOUT_MACROP, timeout_encode(mclks))
+    if not ok
+        let _back = wr(p, PAGE, 0x00)
+        return false
+    budget_write(p, budget) and phase_calibrate(p)
+
+// ── The reference calibration ────────────────────────────────────────
+
+// One reference calibration: starts a ranging with `init_byte` ORed into
+// SYSRANGE_START, waits for the result, clears the interrupt and stops.
+pub fn calibrate_once<P: Vl53l0xPort>(p: P, init_byte: Int) -> Bool [hw]
+    if not wr(p, SYSRANGE_START, START_SINGLE | init_byte)
+        return false
+    if not poll_set(p, RESULT_INTERRUPT_STATUS, 0x07, CAL_WAIT_MS)
+        return false
+    wr(p, SYSTEM_INTERRUPT_CLEAR, 0x01) and wr(p, SYSRANGE_START, 0x00)
+
+// The phase calibration, which is needed after a change of a VCSEL
+// period: the sequence is set to the phase step only, the calibration
+// runs, and the sequence the part had is put back.
+pub fn phase_calibrate<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    let Some(seq) = rd(p, SYSTEM_SEQUENCE_CONFIG) else return false
+    let ok = wr(p, SYSTEM_SEQUENCE_CONFIG, 0x02) and calibrate_once(p, 0x00)
+    wr(p, SYSTEM_SEQUENCE_CONFIG, seq) and ok
+
+// The calibration after the static initialisation: VHV, then phase, then
+// the sequence of the initialisation put back (MSRC and TCC off).
+pub fn ref_calibrate<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    if not (wr(p, SYSTEM_SEQUENCE_CONFIG, 0x01) and calibrate_once(p, START_VHV))
+        return false
+    if not (wr(p, SYSTEM_SEQUENCE_CONFIG, 0x02) and calibrate_once(p, 0x00))
+        return false
+    wr(p, SYSTEM_SEQUENCE_CONFIG, 0xE8)
+
+// ── The initialisation ───────────────────────────────────────────────
+
+// Step 2, the data initialisation: the stop variable, or `None`.  I/O at
+// 2.8 V when `io_2v8` (the breakouts' level shifters expect it), I2C in
+// standard mode, the stop variable read from the pages, the signal-rate
+// and pre-range limit checks off, the final range's signal-rate limit at
+// 0.25 MCPS, and every sequence step enabled.
+pub fn data_init<P: Vl53l0xPort>(p: P, io_2v8: Bool) -> ?Int [hw]
+    if io_2v8
+        if not upd(p, VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV, 0x01, 0x01)
+            return None
+    if not wr(p, 0x88, 0x00)
+        return None
+    if not page_enter(p)
+        let _out = page_leave(p)
+        return None
+    let sv = rd(p, STOP_VARIABLE)
+    if not page_leave(p)
+        return None
+    let Some(stop_var) = sv else return None
+    if not (upd(p, MSRC_CONFIG_CONTROL, 0x12, 0x12) and limit_write(p, DEFAULT_LIMIT_MMCPS) and wr(p, SYSTEM_SEQUENCE_CONFIG, 0xFF))
+        return None
+    Some(stop_var)
+
+// The reference SPAD count and type from the part's NVM: the count in the
+// low seven bits and the type (aperture) in bit 7, or `None`.  The part
+// is asked through registers of pages 6 and 7 and answers in 0x92.  The
+// page register is back at 0 on every path.
+pub fn spad_info<P: Vl53l0xPort>(p: P) -> ?Int [hw]
+    var got = false
+    var info = 0
+    let up = wr(p, POWER_PAGES, 0x01) and wr(p, PAGE, 0x01) and wr(p, 0x00, 0x00) and wr(p, PAGE, 0x06) and upd(p, 0x83, 0x04, 0x04) and wr(p, PAGE, 0x07) and wr(p, 0x81, 0x01) and wr(p, POWER_PAGES, 0x01) and wr(p, 0x94, 0x6B) and wr(p, 0x83, 0x00)
+    if up
+        if poll_set(p, 0x83, 0xFF, SPAD_WAIT_MS)
+            if wr(p, 0x83, 0x01)
+                if let Some(v) = rd(p, 0x92)
+                    got = true
+                    info = v
+    let down = wr(p, 0x81, 0x00) and wr(p, PAGE, 0x06) and upd(p, 0x83, 0x04, 0x00) and wr(p, PAGE, 0x01) and wr(p, 0x00, 0x01) and wr(p, PAGE, 0x00) and wr(p, POWER_PAGES, 0x00)
+    if got and down
+        return Some(info)
+    None
+
+// Applies the reference SPAD map (VL53L0X_set_reference_spads with the
+// NVM values assumed valid): the first SPAD to enable is 12 for the
+// aperture type and 0 for the non-aperture type, `count` SPADs are
+// enabled from there out of those the part has, and the rest are cleared.
+pub fn ref_spads_apply<P: Vl53l0xPort>(p: P, count: Int, aperture: Bool) -> Bool [hw]
+    var map: DevBytes = Vec.new()
+    if not p.read_regs(SPAD_ENABLES_REF, 6, var map)
+        return false
+    if not (wr(p, PAGE, 0x01) and wr(p, DYNAMIC_SPAD_REF_EN_START_OFFSET, 0x00) and wr(p, DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD, 0x2C) and wr(p, PAGE, 0x00) and wr(p, GLOBAL_CONFIG_REF_EN_START_SELECT, 0xB4))
+        return false
+    var first = 0
+    if aperture
+        first = 12
+    var enabled = 0
+    var out: DevBytes = Vec.new()
+    for byte_i in 0..6
+        var b = map[byte_i] as Int
+        for bit in 0..8
+            let i = byte_i * 8 + bit
+            if i < first or enabled == count
+                b = b & (0xFF ^ (1 << bit))
+            elif ((b >> bit) & 1) == 1
+                enabled = enabled + 1
+        let _ = out.push(b as u8)
+    p.write_regs(SPAD_ENABLES_REF, out)
+
+// Loads the tuning table: every pair of `TUNING` written in order.
+pub fn tuning_load<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    for k in 0..TUNING_PAIRS
+        if not wr(p, TUNING[k * 2], TUNING[k * 2 + 1])
+            return false
+    true
+
+// Configures GPIO1 for "new sample ready", active low, and clears the
+// interrupt.
+pub fn gpio_config<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    wr(p, SYSTEM_INTERRUPT_CONFIG_GPIO, 0x04) and upd(p, GPIO_HV_MUX_ACTIVE_HIGH, 0x10, 0x00) and wr(p, SYSTEM_INTERRUPT_CLEAR, 0x01)
+
+// Step 3, the static initialisation.  The budget the part came up with is
+// read before MSRC and TCC are switched off and applied again after, so
+// the final range keeps the time those steps give up.
+pub fn static_init<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    let Some(info) = spad_info(p) else return false
+    if not ref_spads_apply(p, info & 0x7F, (info >> 7) == 1)
+        return false
+    if not (tuning_load(p) and gpio_config(p))
+        return false
+    let Some(budget) = budget_read(p) else return false
+    wr(p, SYSTEM_SEQUENCE_CONFIG, 0xE8) and budget_write(p, budget)
+
+// Cycles the shutdown pin when the wiring has one: low, then high, with
+// the booting time after each (the datasheet gives tBOOT as 1.2 ms at
+// most).  The part comes back at address 0x29.  Answers whether the
+// wiring has the pin.
+pub fn reset_cycle<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    if not p.xshut(0)
+        return false
+    p.wait_ms(BOOT_MS)
+    let _up = p.xshut(1)
+    p.wait_ms(BOOT_MS)
+    true
+
+// Makes the bus ready, cycles the shutdown pin if there is one, and
+// brings the part up with `start`.
+pub fn bring_up<P: Vl53l0xPort>(p: P, io_2v8: Bool) -> ?Vl53State [hw]
+    if not p.setup()
+        return None
+    let _cycled = reset_cycle(p)
+    start(p, io_2v8)
+
+// Brings the part up: the model ID, the data initialisation, the static
+// initialisation, the reference calibration.  The state to keep, or `None`
+// for a part that did not answer as a VL53L0X or did not take a step.
+pub fn start<P: Vl53l0xPort>(p: P, io_2v8: Bool) -> ?Vl53State [hw]
+    if not model_ok(p)
+        return None
+    let Some(stop_var) = data_init(p, io_2v8) else return None
+    if not static_init(p)
+        return None
+    if not ref_calibrate(p)
+        return None
+    Some(Vl53State { stop_var: stop_var, continuous: false })
+
+// ── Measurements ─────────────────────────────────────────────────────
+
+// Writes the stop variable back before a measurement starts.
+pub fn stop_var_restore<P: Vl53l0xPort>(p: P, stop_var: Int) -> Bool [hw]
+    if not page_enter(p)
+        let _out = page_leave(p)
+        return false
+    let ok = wr(p, STOP_VARIABLE, stop_var)
+    page_leave(p) and ok
+
+// Starts one single-shot measurement: the interrupt flag of any earlier
+// result is cleared, the stop variable written back, the start bit set.
+pub fn single_start<P: Vl53l0xPort>(p: P, stop_var: Int) -> Bool [hw]
+    wr(p, SYSTEM_INTERRUPT_CLEAR, 0x01) and stop_var_restore(p, stop_var) and wr(p, SYSRANGE_START, START_SINGLE)
+
+// Starts continuous ranging.  With `period_ms` 0 the part measures back
+// to back; otherwise it measures every `period_ms`, and the period is
+// written in the part's oscillator ticks (the API multiplies by the
+// calibrated oscillator value when it is not zero).
+pub fn continuous_start<P: Vl53l0xPort>(p: P, stop_var: Int, period_ms: Int) -> Bool [hw]
+    if not (wr(p, SYSTEM_INTERRUPT_CLEAR, 0x01) and stop_var_restore(p, stop_var))
+        return false
+    if period_ms <= 0
+        return wr(p, SYSRANGE_START, START_BACK_TO_BACK)
+    let Some(osc) = rd16(p, OSC_CALIBRATE_VAL) else return false
+    var ticks = period_ms
+    if osc != 0
+        ticks = period_ms * osc
+    wr32(p, SYSTEM_INTERMEASUREMENT_PERIOD, ticks) and wr(p, SYSRANGE_START, START_TIMED)
+
+// Stops continuous ranging: the single-shot mode is selected, which ends
+// the sequence, and the stop variable is zeroed, as the API does.
+pub fn continuous_stop<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    wr(p, SYSRANGE_START, START_SINGLE) and wr(p, PAGE, 0x01) and wr(p, 0x00, 0x00) and wr(p, STOP_VARIABLE, 0x00) and wr(p, 0x00, 0x01) and wr(p, PAGE, 0x00)
+
+// Whether a result waits: RESULT_INTERRUPT_STATUS bits 2:0 are not zero.
+pub fn result_ready<P: Vl53l0xPort>(p: P) -> Bool [hw]
+    ((rd(p, RESULT_INTERRUPT_STATUS) ?? 0) & 0x07) != 0
+
+// The status ST's API reports for a device status code.  Code 11 is a good
+// range; 4 is a return too weak for the final range's limit; 6 and 9 are
+// the phase checks, which fail when the target is beyond the unambiguous
+// range or the signal is noisy; 8 and 10 are the target-centre and
+// minimum-clip checks; 1, 2 and 3 are hardware faults; the others are
+// ST's "no update".
+pub fn status_of_code(code: Int) -> RangeStatus
+    if code == CODE_RANGE_COMPLETE
+        return RangeStatus.RangeValid
+    if code == CODE_MSRC_NO_TARGET
+        return RangeStatus.RangeWeak
+    if code == CODE_RANGE_PHASE or code == CODE_PHASE_CONSISTENCY or code == CODE_TCC or code == CODE_MIN_CLIP
+        return RangeStatus.RangeOutOfRange
+    if code == CODE_VCSEL_CONTINUITY or code == CODE_VCSEL_WATCHDOG or code == CODE_NO_VHV
+        return RangeStatus.RangeFault
+    RangeStatus.RangeNoTarget
+
+// The reading for a status byte and a range: the code is bits 6:3 of the
+// byte, a range of 8190 mm or more is out of range whatever the code
+// says, and a status that carries no distance reads 0 mm.
+pub fn reading_of(status_byte: Int, range_mm: Int) -> RangeReading
+    var st = status_of_code((status_byte >> 3) & 0x0F)
+    if (st == RangeStatus.RangeValid or st == RangeStatus.RangeWeak) and range_mm >= OUT_OF_RANGE_MM
+        st = RangeStatus.RangeOutOfRange
+    if st == RangeStatus.RangeValid or st == RangeStatus.RangeWeak
+        return RangeReading { mm: range_mm, status: st }
+    RangeReading { mm: 0, status: st }
+
+// Reads the result registers and clears the interrupt: the reading, or
+// `None` when the part did not answer.  The 12 bytes from 0x14 are read
+// in one transaction, so the status and the range are of one result.
+pub fn result_read<P: Vl53l0xPort>(p: P) -> ?RangeReading [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(RESULT_RANGE_STATUS, 12, var b)
+        return None
+    if not wr(p, SYSTEM_INTERRUPT_CLEAR, 0x01)
+        return None
+    Some(reading_of(b[0] as Int, (b[10] as Int << 8) | b[11] as Int))
+
+// Waits for a result, at most 1.1 s, and reads it.
+pub fn result_wait<P: Vl53l0xPort>(p: P) -> ?RangeReading [hw]
+    if not poll_set(p, RESULT_INTERRUPT_STATUS, 0x07, RESULT_WAIT_MS)
+        return None
+    result_read(p)
+
+// One single-shot measurement: start, wait, read.
+pub fn measure<P: Vl53l0xPort>(p: P, stop_var: Int) -> ?RangeReading [hw]
+    if not single_start(p, stop_var)
+        return None
+    result_wait(p)
+
+// What `range_start` answers: 0 while the part ranges continuously, else
+// the budget after a single-shot start, or -1.
+pub fn range_start_of<P: Vl53l0xPort>(p: P, st: Vl53State) -> Int [hw]
+    if st.continuous
+        return 0
+    if not single_start(p, st.stop_var)
+        return -1
+    budget_read(p) ?? -1
+
+// The longest distance the part is set to report, in millimetres: 2000
+// for the long-range periods (18 and 14 PCLKs), 1200 for the others, the
+// figures of UM2039 Table 6 for a white target.
+pub fn max_mm_of<P: Vl53l0xPort>(p: P) -> Int [hw]
+    let pre = vcsel_read(p, false) ?? 0
+    let fin = vcsel_read(p, true) ?? 0
+    if pre == 18 and fin == 14
+        return 2000
+    1200
+
+// ── The profiles ─────────────────────────────────────────────────────
+
+// Applies a profile of UM2039 Table 6: the signal-rate limit and the
+// timing budget, and the VCSEL periods the profile needs, set only when
+// they differ because each change runs a phase calibration.
+pub fn profile_apply<P: Vl53l0xPort>(p: P, prof: Vl53Profile) -> Bool [hw]
+    var pre = 14
+    var fin = 10
+    var limit = 250
+    var budget = 33000
+    match prof
+        Vl53Default =>
+            budget = 33000
+        Vl53HighAccuracy =>
+            budget = 200000
+        Vl53LongRange =>
+            pre = 18
+            fin = 14
+            limit = 100
+        Vl53HighSpeed =>
+            budget = 20000
+    let Some(cur_pre) = vcsel_read(p, false) else return false
+    let Some(cur_fin) = vcsel_read(p, true) else return false
+    if cur_pre != pre
+        if not pre_period_write(p, pre)
+            return false
+    if cur_fin != fin
+        if not final_period_write(p, fin)
+            return false
+    limit_write(p, limit) and budget_write(p, budget)
+
+// ── The part on a board's I2C bus ────────────────────────────────────
+
+pub @value
+struct Vl53l0x
+    bus: BoardI2c
+    timer: BoardTimer
+    pins: BoardGpio
+    w: DeviceWiring
+    st: Vl53State
+
+impl Vl53l0xPort for Vl53l0x
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        i2c_write_from(self.bus, self.w, reg, src)
+
+    fn now_ms(self) -> Int [hw]
+        self.timer.ticks_ms()
+
+    fn wait_ms(self, ms: Int) [hw]
+        self.timer.delay_ms(ms)
+
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    fn xshut(self, level: Int) -> Bool [hw]
+        xshut_of(self.pins, self.w, level)
+
+// The part with another state.
+pub fn with_state(d: Vl53l0x, st: Vl53State) -> Vl53l0x
+    Vl53l0x { bus: d.bus, timer: d.timer, pins: d.pins, w: d.w, st: st }
+
+// The part with the state `bring_up` answered, or as it was.
+pub fn with_started(d: Vl53l0x, r: ?Vl53State) -> Vl53l0x
+    match r
+        Some(s) => with_state(d, s)
+        None    => d
+
+// The part with continuous ranging marked on or off, when the part took
+// the start or the stop (`ok`), or as it was.
+pub fn with_continuous(d: Vl53l0x, ok: Bool, on: Bool) -> Vl53l0x
+    if not ok
+        return d
+    with_state(d, Vl53State { stop_var: d.st.stop_var, continuous: on })
+
+// The part at another address, when the part took the write (`ok`), or as
+// it was.
+pub fn with_addr(d: Vl53l0x, ok: Bool, addr: Int) -> Vl53l0x
+    if not ok
+        return d
+    Vl53l0x { bus: d.bus, timer: d.timer, pins: d.pins, w: DeviceWiring { bus: d.w.bus, addr: Some(addr & 0x7F), cs: None, irq: d.w.irq, en: d.w.en }, st: d.st }
+
+impl Vl53l0x
+    // The part at `w.addr` on the board's I2C bus, as a board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring) -> Vl53l0x
+        Vl53l0x { bus: bus, timer: timer, pins: pins, w: w, st: Vl53State { stop_var: 0, continuous: false } }
+
+    // Brings the part up at 2.8 V I/O (`bring_up`), after a cycle of the
+    // shutdown pin when the wiring has one.  Answers whether the part
+    // came up.
+    fn begin(var self) -> Bool [hw]
+        self.begin_io(true)
+
+    // As `begin`, with the I/O level chosen: `false` leaves the part at its
+    // 1.8 V I/O.
+    fn begin_io(var self, io_2v8: Bool) -> Bool [hw]
+        let r = bring_up(self, io_2v8)
+        self = with_started(self, r)
+        r != None
+
+    // A profile of UM2039 Table 6.
+    fn set_profile(self, prof: Vl53Profile) -> Bool [hw]
+        profile_apply(self, prof)
+
+    // The measurement timing budget in microseconds, 0 if the part does
+    // not answer, and a new one.
+    fn timing_budget_us(self) -> Int [hw]
+        budget_read(self) ?? 0
+
+    fn set_timing_budget_us(self, us: Int) -> Bool [hw]
+        budget_write(self, us)
+
+    // The signal-rate limit in thousandths of a MCPS, -1 if the part does
+    // not answer, and a new one.
+    fn signal_rate_limit_mmcps(self) -> Int [hw]
+        limit_read(self) ?? -1
+
+    fn set_signal_rate_limit_mmcps(self, v: Int) -> Bool [hw]
+        limit_write(self, v)
+
+    // The pre-range and final-range VCSEL periods in PCLKs, 0 if the
+    // part does not answer.
+    fn vcsel_period(self, final_range: Bool) -> Int [hw]
+        vcsel_read(self, final_range) ?? 0
+
+    // Starts continuous ranging, back to back for a period of 0.
+    fn continuous_begin(var self, period_ms: Int) -> Bool [hw]
+        let ok = continuous_start(self, self.st.stop_var, period_ms)
+        self = with_continuous(self, ok, true)
+        ok
+
+    // Stops continuous ranging.
+    fn continuous_end(var self) -> Bool [hw]
+        let ok = continuous_stop(self)
+        self = with_continuous(self, ok, false)
+        ok
+
+    // One blocking measurement.
+    fn measure_now(self) -> ?RangeReading [hw]
+        measure(self, self.st.stop_var)
+
+    // Whether a result waits.
+    fn data_ready(self) -> Bool [hw]
+        result_ready(self)
+
+    // Moves the part to another I2C address, which it keeps until the
+    // next power-up or shutdown, and follows it: whether the part took
+    // the write.
+    fn move_to(var self, addr: Int) -> Bool [hw]
+        let ok = wr(self, I2C_SLAVE_DEVICE_ADDRESS, addr & 0x7F)
+        self = with_addr(self, ok, addr)
+        ok
+
+    // One register, for the registers this driver does not name.
+    fn reg(self, r: Int) -> ?Int [hw]
+        rd(self, r)
+
+    // The level of GPIO1, -1 without a pin in the wiring.
+    fn gpio1_level(self) -> Int [hw]
+        self.irq_level()
+
+impl Rangefinder[hw] for Vl53l0x
+    // Starts a single-shot measurement and answers the budget, the time it
+    // takes, in microseconds; for continuous ranging the answer is 0 and
+    // nothing is started.  A negative answer is a part that did not take
+    // the start.
+    fn range_start(self) -> Int [hw]
+        range_start_of(self, self.st)
+
+    // Waits for the result, at most 1.1 s, and reads it: `None` when the
+    // part did not answer or no result came.
+    fn range_read(self) -> ?RangeReading [hw]
+        result_wait(self)
+
+    fn range_max_mm(self) -> Int [hw]
+        max_mm_of(self)
+
+impl Identifiable[hw] for Vl53l0x
+    // The model ID, 0xEE, and the revision register, 0x10 on the parts
+    // seen.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)

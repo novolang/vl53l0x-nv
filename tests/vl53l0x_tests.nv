@@ -1,0 +1,1372 @@
+// vl53l0x_tests — the driver over a double of the part: a register file
+// that is paged the way the part's is (the register at 0xFF selects the
+// page of every register but 0x80 and 0xFF), answers the model ID and the
+// reference registers of the datasheet (DocID029104 Rev 2, Table 4), and
+// behaves as the open drivers' sequences expect: the SPAD handshake of
+// pages 6 and 7, the interrupt flag that a ranging or a calibration
+// raises after some polls and that a write to 0x0B clears, and an I2C
+// address that can be moved.  Every transaction advances the clock by a
+// millisecond.  The log keeps what the controller sent, in a form the
+// tests compare.
+//
+// Log entries: a write is 1, the register, the bytes, -1; a read is 2, the
+// register, the count, -1.  The register in an entry is its address on
+// the page the controller had selected.
+//
+// The double's state `st`:
+//   0 the clock in ms        1 transactions so far    2 the transaction that fails
+//   3 the first transaction of a run that all fail    4 1 when a part is there
+//   10 polls the SPAD handshake takes    11 1 when it never ends
+//   12 polls left    13 1 while armed
+//   14 the SPAD info byte 0x92 answers
+//   20 polls a ranging or calibration takes   21 1 when it never ends
+//   22 polls left    23 1 while pending
+//   30 the I2C address the part answers at   31 the bus clock    40 the page
+//   99 entries in the log
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_range.{ RangeReading, RangeStatus, Rangefinder }
+use dev_id.{ DeviceId, Identifiable }
+use vl53l0x
+use vl53l0x.{ Vl53l0x, Vl53State, Vl53Profile, Vl53l0xPort }
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The key of a register on the page now selected: 0x80 and 0xFF are on
+// every page.
+fn key(c: Chip, reg: Int) -> Int
+    if reg == 0x80 or reg == 0xFF
+        return reg
+    at(c.st, 40) * 256 + reg
+
+// Puts a register of page 0 into the file.
+fn put(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v)
+
+// The part as it comes out of reset: the reference registers, every
+// sequence step enabled, the pre-range and final-range periods at 14 and
+// 10 PCLKs, a pre-range timeout of 9 macro periods and a final-range
+// timeout of 561, the stop variable 0x3C on page 1, the reference SPAD map
+// all ones, GPIO1 active high.
+@tier(app)
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    put(c, 0xC0, 0xEE)
+    put(c, 0xC1, 0xAA)
+    put(c, 0xC2, 0x10)
+    put(c, 0x01, 0xFF)
+    put(c, 0x46, 0x25)
+    put(c, 0x50, 0x06)
+    put(c, 0x51, 0x00)
+    put(c, 0x52, 0x08)
+    put(c, 0x70, 0x04)
+    put(c, 0x71, 0x02)
+    put(c, 0x72, 0x8C)
+    put(c, 0x84, 0x10)
+    for i in 0..6
+        put(c, 0xB0 + i, 0xFF)
+    c.regs.insert(256 + 0x91, 0x3C)
+    c.st.insert(4, 1)
+    c.st.insert(10, 2)
+    c.st.insert(14, 0x85)
+    c.st.insert(20, 1)
+    c.st.insert(30, 0x29)
+    c
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    let page = at(c.st, 40)
+    if page == 0 and reg == 0x13
+        if at(c.st, 23) == 1
+            if at(c.st, 21) == 1
+                return 0
+            if at(c.st, 22) > 0
+                c.st.insert(22, at(c.st, 22) - 1)
+                return 0
+            return 0x04
+        return at(c.regs, key(c, reg))
+    if page == 7 and reg == 0x83 and at(c.st, 13) == 1
+        if at(c.st, 11) == 1
+            return 0
+        if at(c.st, 12) > 0
+            c.st.insert(12, at(c.st, 12) - 1)
+            return 0
+        c.st.insert(13, 0)
+        c.regs.insert(key(c, reg), 1)
+        return 1
+    if page == 7 and reg == 0x92
+        return at(c.st, 14)
+    at(c.regs, key(c, reg))
+
+// A write: the page register selects a page, a start in SYSRANGE_START
+// (modes 1, 2 and 4 in the low bits) makes a result pending, 0x0B clears
+// it, 0x83 on page 7 written 0 arms the SPAD handshake, 0x8A moves the
+// address.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    let page = at(c.st, 40)
+    if reg == 0xFF
+        c.st.insert(40, v)
+        c.regs.insert(0xFF, v)
+        return
+    c.regs.insert(key(c, reg), v)
+    if page == 0 and reg == 0x00 and (v & 0x07) != 0
+        c.st.insert(23, 1)
+        c.st.insert(22, at(c.st, 20))
+    if page == 0 and reg == 0x0B and (v & 1) == 1
+        c.st.insert(23, 0)
+    if page == 7 and reg == 0x83 and v == 0
+        c.st.insert(13, 1)
+        c.st.insert(12, at(c.st, 10))
+    if page == 0 and reg == 0x8A
+        c.st.insert(30, v & 0x7F)
+
+// Whether the transaction now being made is one that fails.
+fn fails(c: Chip) -> Bool
+    let n = at(c.st, 1) + 1
+    c.st.insert(1, n)
+    c.st.insert(0, at(c.st, 0) + 1)
+    if at(c.st, 2) == n
+        return true
+    at(c.st, 3) > 0 and n >= at(c.st, 3)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(31, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, data[0] as Int)
+        for i in 1..data.len()
+            log_push(self.c, data[i] as Int)
+        log_push(self.c, -1)
+        if fails(self.c) or addr != at(self.c.st, 30) or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        let reg = data[0] as Int
+        for i in 1..data.len()
+            chip_write(self.c, reg + i - 1, data[i] as Int)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if fails(self.c) or addr != at(self.c.st, 30) or at(self.c.st, 4) == 0
+            return None
+        let reg = tx[0] as Int
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, chip_read(self.c, reg + i) as u8)
+        Some(out)
+
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+    sets: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        let n = at(self.sets, 0)
+        self.sets.insert(n + 1, pin * 10 + val)
+        self.sets.insert(0, n + 1)
+        self.sets.insert(100 + n, at(self.c.st, 0))
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new(), sets: HashMap.new() }
+
+// The part's wiring: address 0x29, GPIO1 on pin 7, XSHUT on pin 8.
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_en(dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x29), 7), 8)
+
+fn wiring_plain() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x29)
+
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    c: Chip
+    w: DeviceWiring
+
+impl Vl53l0xPort for Dut
+    fn setup(self) -> Bool [hw]
+        vl53l0x.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        vl53l0x.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        vl53l0x.i2c_write_from(self.bus, self.w, reg, src)
+
+    fn now_ms(self) -> Int [hw]
+        at(self.c.st, 0)
+
+    fn wait_ms(self, ms: Int) [hw]
+        self.c.st.insert(0, at(self.c.st, 0) + ms)
+
+    fn irq_level(self) -> Int [hw]
+        vl53l0x.irq_level_of(self.pins, self.w)
+
+    fn xshut(self, level: Int) -> Bool [hw]
+        vl53l0x.xshut_of(self.pins, self.w, level)
+
+@tier(app)
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: wiring() }
+
+@tier(app)
+fn dut_plain(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: wiring_plain() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// The register of page `page` as the part holds it.
+fn reg_of(c: Chip, page: Int, reg: Int) -> Int
+    at(c.regs, page * 256 + reg)
+
+fn mm_of(o: ?RangeReading) -> Int
+    match o
+        Some(r) => r.mm
+        None    => -99999
+
+fn status_of(o: ?RangeReading) -> RangeStatus
+    match o
+        Some(r) => r.status
+        None    => RangeStatus.RangeFault
+
+fn abs(v: Int) -> Int
+    if v < 0
+        return 0 - v
+    v
+
+// Puts a result in the 12 result registers: the status byte, the signal
+// and the range.
+fn put_result(c: Chip, status_byte: Int, mm: Int)
+    put(c, 0x14, status_byte)
+    put(c, 0x1A, 0x00)
+    put(c, 0x1B, 0x80)
+    put(c, 0x1E, mm >> 8)
+    put(c, 0x1F, mm & 0xFF)
+
+// The status byte for a device code: the code is bits 6:3.
+fn code(n: Int) -> Int
+    n << 3
+
+// The transactions a call makes with the bus working, so that a test can
+// fail each of them in turn.
+fn count_of_good_run(c: Chip) -> Int
+    at(c.st, 1)
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_read_is_the_register_then_a_repeated_start() [io, hw]
+    let c = chip()
+    var b: DevBytes = Vec.new()
+    test.assert(vl53l0x.i2c_read_into(FakeI2c { c: c }, wiring(), 0xC0, 3, var b))
+    test.assert_eq(b[0] as Int, 0xEE)
+    test.assert_eq(b[1] as Int, 0xAA)
+    test.assert_eq(b[2] as Int, 0x10)
+    log_is(c, [2, 0xC0, 3, -1])
+
+@test
+fn test_a_write_is_the_register_then_the_bytes_in_one_frame() [io, hw]
+    let c = chip()
+    var s: DevBytes = Vec.new()
+    let _ = s.push(0x12 as u8)
+    let _ = s.push(0x34 as u8)
+    test.assert(vl53l0x.i2c_write_from(FakeI2c { c: c }, wiring(), 0x44, s))
+    log_is(c, [1, 0x44, 0x12, 0x34, -1])
+    test.assert_eq(reg_of(c, 0, 0x44), 0x12)
+    test.assert_eq(reg_of(c, 0, 0x45), 0x34)
+
+@test
+fn test_setup_makes_the_pins_ready_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 31), 400000)
+    test.assert_eq(at(d.pins.modes, 7), 0)
+    test.assert_eq(at(d.pins.modes, 8), 1)
+    let plain = dut_plain(chip())
+    test.assert(plain.setup())
+    test.assert_eq(at(plain.pins.modes, 7), 0)
+    test.assert_eq(at(plain.pins.modes, 8), 0)
+    let spi = DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None }
+    test.assert(not vl53l0x.i2c_setup(FakeI2c { c: c }, pins(c), spi))
+
+@test
+fn test_gpio1_and_xshut_follow_the_wiring() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(d.irq_level(), 0)
+    d.pins.levels.insert(7, 1)
+    test.assert_eq(d.irq_level(), 1)
+    test.assert(d.xshut(1))
+    test.assert_eq(at(d.pins.levels, 8), 1)
+    let plain = dut_plain(c)
+    test.assert_eq(plain.irq_level(), -1)
+    test.assert(not plain.xshut(1))
+
+// ── Register access ──────────────────────────────────────────────────
+
+@test
+fn test_one_two_and_four_byte_values_are_most_significant_byte_first() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.wr(d, 0x30, 0x1AB))
+    test.assert_eq(reg_of(c, 0, 0x30), 0xAB)
+    test.assert(vl53l0x.wr16(d, 0x31, 0x1234))
+    test.assert_eq(reg_of(c, 0, 0x31), 0x12)
+    test.assert_eq(reg_of(c, 0, 0x32), 0x34)
+    test.assert(vl53l0x.wr32(d, 0x35, 0x01020304))
+    test.assert_eq(reg_of(c, 0, 0x35), 0x01)
+    test.assert_eq(reg_of(c, 0, 0x38), 0x04)
+    test.assert_eq(vl53l0x.rd(d, 0x30), Some(0xAB))
+    test.assert_eq(vl53l0x.rd16(d, 0x31), Some(0x1234))
+    test.assert(vl53l0x.rd(d, 0x77) == Some(0))
+
+@test
+fn test_a_part_that_does_not_answer_reads_as_none_and_writes_as_false() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = dut(c)
+    test.assert(vl53l0x.rd(d, 0xC0) == None)
+    test.assert(vl53l0x.rd16(d, 0xC0) == None)
+    test.assert(not vl53l0x.wr(d, 0x30, 1))
+    test.assert(not vl53l0x.upd(d, 0x30, 1, 1))
+
+@test
+fn test_upd_changes_the_bits_of_the_mask_and_keeps_the_others() [io, hw]
+    let c = chip()
+    put(c, 0x30, 0xA5)
+    let d = dut(c)
+    test.assert(vl53l0x.upd(d, 0x30, 0x0F, 0x03))
+    test.assert_eq(reg_of(c, 0, 0x30), 0xA3)
+    test.assert(vl53l0x.upd(d, 0x30, 0x80, 0x00))
+    test.assert_eq(reg_of(c, 0, 0x30), 0x23)
+
+@test
+fn test_poll_set_reads_until_a_bit_is_set_or_the_time_is_up() [io, hw]
+    let c = chip()
+    put(c, 0x30, 0x00)
+    let d = dut(c)
+    test.assert(not vl53l0x.poll_set(d, 0x30, 0x01, 10))
+    test.assert(at(c.st, 0) >= 10)
+    put(c, 0x30, 0x02)
+    test.assert(vl53l0x.poll_set(d, 0x30, 0x03, 10))
+    c.st.insert(4, 0)
+    test.assert(not vl53l0x.poll_set(d, 0x30, 0x03, 10))
+
+@test
+fn test_the_page_sequences_enter_and_leave_by_the_same_registers() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.page_enter(d))
+    log_is(c, [1, 0x80, 1, -1, 1, 0xFF, 1, -1, 1, 0x00, 0, -1])
+    test.assert_eq(at(c.st, 40), 1)
+    test.assert(vl53l0x.page_leave(d))
+    log_is(c, [1, 0x00, 1, -1, 1, 0xFF, 0, -1, 1, 0x80, 0, -1])
+    test.assert_eq(at(c.st, 40), 0)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_model_id_is_0xee_and_the_revision_is_read_with_it() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.model_ok(d))
+    match vl53l0x.id_read(d)
+        Some(id) =>
+            test.assert_eq(id.who, 0xEE)
+            test.assert(id.rev == Some(0x10))
+        None => test.assert(false)
+    put(c, 0xC0, 0x60)
+    test.assert(not vl53l0x.model_ok(d))
+    test.assert(vl53l0x.id_read(d) == None)
+    c.st.insert(4, 0)
+    test.assert(vl53l0x.id_read(d) == None)
+
+// ── The arithmetic of the API ────────────────────────────────────────
+
+@test
+fn test_the_vcsel_period_is_twice_the_register_plus_one() [io, hw]
+    test.assert_eq(vl53l0x.vcsel_pclks_of(6), 14)
+    test.assert_eq(vl53l0x.vcsel_pclks_of(4), 10)
+    test.assert_eq(vl53l0x.vcsel_reg_of(18), 8)
+    test.assert_eq(vl53l0x.vcsel_reg_of(8), 3)
+
+@test
+fn test_the_macro_period_in_nanoseconds() [io, hw]
+    test.assert_eq(vl53l0x.macro_period_ns(8), 30505)
+    test.assert_eq(vl53l0x.macro_period_ns(10), 38131)
+    test.assert_eq(vl53l0x.macro_period_ns(14), 53384)
+    test.assert_eq(vl53l0x.macro_period_ns(18), 68636)
+
+@test
+fn test_timeouts_convert_between_macro_periods_and_microseconds() [io, hw]
+    test.assert_eq(vl53l0x.mclks_to_us(552, 10), 21048)
+    test.assert_eq(vl53l0x.mclks_to_us(9, 14), 480)
+    test.assert_eq(vl53l0x.us_to_mclks(21048, 10), 552)
+    test.assert_eq(vl53l0x.us_to_mclks(480, 14), 9)
+
+@test
+fn test_a_timeout_register_is_lsb_times_two_to_the_msb_plus_one() [io, hw]
+    test.assert_eq(vl53l0x.timeout_decode(0x0008), 9)
+    test.assert_eq(vl53l0x.timeout_decode(0x028C), 561)
+    test.assert_eq(vl53l0x.timeout_decode(0x0180), 257)
+    test.assert_eq(vl53l0x.timeout_encode(0), 0)
+    test.assert_eq(vl53l0x.timeout_encode(1), 0)
+    test.assert_eq(vl53l0x.timeout_encode(256), 255)
+    test.assert_eq(vl53l0x.timeout_encode(257), 0x180)
+    test.assert_eq(vl53l0x.timeout_encode(1000), 0x2F9)
+    test.assert_eq(vl53l0x.timeout_encode(-3), 0)
+
+@test
+fn test_encoding_loses_at_most_the_low_bits_the_exponent_drops() [io, hw]
+    for m in [9, 100, 256, 300, 561, 1000, 5000, 25972]
+        let back = vl53l0x.timeout_decode(vl53l0x.timeout_encode(m))
+        test.assert(back <= m)
+        test.assert(m - back < (m / 128) + 2)
+
+// ── The sequence and the timing budget ───────────────────────────────
+
+@test
+fn test_the_sequence_steps_and_their_times_are_read_from_the_part() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    let Some(s) = vl53l0x.seq_read(d) else
+        test.assert(false)
+        return
+    test.assert(not s.tcc)
+    test.assert(s.dss)
+    test.assert(not s.msrc)
+    test.assert(s.pre)
+    test.assert(s.fin)
+    test.assert_eq(s.pre_pclks, 14)
+    test.assert_eq(s.fin_pclks, 10)
+    test.assert_eq(s.msrc_us, 2029)
+    test.assert_eq(s.pre_mclks, 9)
+    test.assert_eq(s.pre_us, 480)
+    test.assert_eq(s.fin_us, 21048)
+    test.assert_eq(vl53l0x.used_us(s), 9448)
+
+@test
+fn test_the_budget_is_the_overheads_and_the_enabled_steps() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    put(c, 0x01, 0xE8)
+    test.assert(vl53l0x.budget_read(d) == Some(31046))
+    // Every step on: TCC and MSRC add their times.
+    put(c, 0x01, 0xFF)
+    test.assert(vl53l0x.budget_read(d) == Some(33665))
+    // Only MSRC and the final range: MSRC counts alone.
+    put(c, 0x01, 0x84)
+    let Some(b) = vl53l0x.budget_read(d) else
+        test.assert(false)
+        return
+    test.assert_eq(b, 1910 + 960 + 2029 + 660 + 21391 + 550)
+    put(c, 0x01, 0x00)
+    test.assert(vl53l0x.budget_read(d) == Some(1910 + 960))
+    c.st.insert(4, 0)
+    test.assert(vl53l0x.budget_read(d) == None)
+
+@test
+fn test_a_budget_is_written_as_the_final_range_timeout_with_the_pre_range_added() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    test.assert(vl53l0x.budget_write(d, 33000))
+    // 33000 - 9448 - 550 = 23002 us = 603 macro periods at 10 PCLKs, plus
+    // the pre-range 9: 612, which is 0x298.
+    test.assert_eq(reg_of(c, 0, 0x71), 0x02)
+    test.assert_eq(reg_of(c, 0, 0x72), 0x98)
+    let Some(b) = vl53l0x.budget_read(d) else
+        test.assert(false)
+        return
+    test.assert_eq(b, 32877)
+    test.assert(abs(b - 33000) < 200)
+
+@test
+fn test_budgets_across_the_range_read_back_within_one_percent() [io, hw]
+    for want in [20000, 50000, 200000, 500000, 1000000]
+        let c = chip()
+        put(c, 0x01, 0xE8)
+        let d = dut(c)
+        test.assert(vl53l0x.budget_write(d, want))
+        let got = vl53l0x.budget_read(d) ?? 0
+        test.assert(got <= want)
+        test.assert(want - got <= want / 100)
+
+@test
+fn test_the_budget_has_limits_and_the_other_steps_come_first() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    test.assert(not vl53l0x.budget_write(d, 19999))
+    test.assert(not vl53l0x.budget_write(d, 1000001))
+    // The steps other than the final range need 10 ms, and the final range
+    // its overhead.
+    test.assert(vl53l0x.budget_write(d, 20000))
+    c.st.insert(4, 0)
+    test.assert(not vl53l0x.budget_write(d, 33000))
+
+@test
+fn test_a_budget_with_the_final_range_off_writes_nothing() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0x68)
+    let d = dut(c)
+    let before = reg_of(c, 0, 0x72)
+    test.assert(vl53l0x.budget_write(d, 33000))
+    test.assert_eq(reg_of(c, 0, 0x72), before)
+
+@test
+fn test_a_budget_the_steps_leave_no_room_for_is_refused() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xFF)
+    // Make the pre-range timeout huge: 0x0A90 is 144 << 10 plus 1.
+    put(c, 0x51, 0x0A)
+    put(c, 0x52, 0x90)
+    let d = dut(c)
+    test.assert(not vl53l0x.budget_write(d, 30000))
+
+// ── The signal-rate limit ────────────────────────────────────────────
+
+@test
+fn test_the_limit_is_a_9_7_fixed_point_number_of_mcps() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.limit_write(d, 250))
+    test.assert_eq(reg_of(c, 0, 0x44), 0x00)
+    test.assert_eq(reg_of(c, 0, 0x45), 0x20)
+    test.assert(vl53l0x.limit_read(d) == Some(250))
+    test.assert(vl53l0x.limit_write(d, 100))
+    test.assert_eq(reg_of(c, 0, 0x45), 12)
+    test.assert(vl53l0x.limit_read(d) == Some(93))
+    test.assert(vl53l0x.limit_write(d, 511990))
+    test.assert(vl53l0x.limit_read(d) == Some(511984))
+    c.st.insert(4, 0)
+    test.assert(vl53l0x.limit_read(d) == None)
+
+@test
+fn test_a_limit_outside_zero_to_511_99_mcps_is_refused() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.limit_write(d, 0))
+    test.assert(not vl53l0x.limit_write(d, -1))
+    test.assert(not vl53l0x.limit_write(d, 511991))
+
+// ── The VCSEL periods ────────────────────────────────────────────────
+
+@test
+fn test_the_periods_are_read_in_pclks() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.vcsel_read(d, false) == Some(14))
+    test.assert(vl53l0x.vcsel_read(d, true) == Some(10))
+    c.st.insert(4, 0)
+    test.assert(vl53l0x.vcsel_read(d, true) == None)
+
+@test
+fn test_the_period_tables_hold_the_values_the_api_writes() [io, hw]
+    test.assert_eq(vl53l0x.pre_phase_high(12), 0x18)
+    test.assert_eq(vl53l0x.pre_phase_high(14), 0x30)
+    test.assert_eq(vl53l0x.pre_phase_high(16), 0x40)
+    test.assert_eq(vl53l0x.pre_phase_high(18), 0x50)
+    test.assert_eq(vl53l0x.pre_phase_high(13), -1)
+    test.assert_eq(vl53l0x.final_phase_high(8), 0x10)
+    test.assert_eq(vl53l0x.final_phase_high(10), 0x28)
+    test.assert_eq(vl53l0x.final_phase_high(12), 0x38)
+    test.assert_eq(vl53l0x.final_phase_high(14), 0x48)
+    test.assert_eq(vl53l0x.final_phase_high(16), -1)
+    test.assert_eq(vl53l0x.final_vcsel_width(8), 2)
+    test.assert_eq(vl53l0x.final_vcsel_width(10), 3)
+    test.assert_eq(vl53l0x.final_vcsel_width(14), 3)
+    test.assert_eq(vl53l0x.final_phasecal_timeout(8), 0x0C)
+    test.assert_eq(vl53l0x.final_phasecal_timeout(10), 0x09)
+    test.assert_eq(vl53l0x.final_phasecal_timeout(12), 0x08)
+    test.assert_eq(vl53l0x.final_phasecal_timeout(14), 0x07)
+    test.assert_eq(vl53l0x.final_phasecal_lim(8), 0x30)
+    test.assert_eq(vl53l0x.final_phasecal_lim(14), 0x20)
+
+@test
+fn test_a_pre_range_period_rewrites_the_phase_limits_and_the_timeouts() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    let before = vl53l0x.budget_read(d) ?? 0
+    test.assert(vl53l0x.pre_period_write(d, 18))
+    test.assert_eq(reg_of(c, 0, 0x57), 0x50)
+    test.assert_eq(reg_of(c, 0, 0x56), 0x08)
+    test.assert_eq(reg_of(c, 0, 0x50), 8)
+    test.assert(vl53l0x.vcsel_read(d, false) == Some(18))
+    // The pre-range time is kept in microseconds: 480 us at 14 PCLKs is 7
+    // macro periods at 18 (68.6 us each).
+    test.assert_eq(vl53l0x.timeout_decode((reg_of(c, 0, 0x51) << 8) | reg_of(c, 0, 0x52)), 7)
+    let after = vl53l0x.budget_read(d) ?? 0
+    test.assert(abs(after - before) < 1000)
+    // The sequence the part had is back after the phase calibration.
+    test.assert_eq(reg_of(c, 0, 0x01), 0xE8)
+    test.assert_eq(at(c.st, 40), 0)
+
+@test
+fn test_every_pre_range_period_is_taken_and_another_is_refused() [io, hw]
+    for pclks in [12, 14, 16, 18]
+        let c = chip()
+        put(c, 0x01, 0xE8)
+        let d = dut(c)
+        test.assert(vl53l0x.pre_period_write(d, pclks))
+        test.assert(vl53l0x.vcsel_read(d, false) == Some(pclks))
+    let c2 = chip()
+    test.assert(not vl53l0x.pre_period_write(dut(c2), 13))
+    c2.st.insert(4, 0)
+    test.assert(not vl53l0x.pre_period_write(dut(c2), 14))
+
+@test
+fn test_the_msrc_timeout_is_capped_at_the_register() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    put(c, 0x46, 0xFF)
+    let d = dut(c)
+    // 256 macro periods at 14 PCLKs is about 13.7 ms; at 18 PCLKs 199 are
+    // enough, and at 12 PCLKs 299 are needed, which the register cannot hold.
+    test.assert(vl53l0x.pre_period_write(d, 12))
+    test.assert_eq(reg_of(c, 0, 0x46), 255)
+
+@test
+fn test_a_final_range_period_sets_the_phase_width_and_calibration_registers() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    test.assert(vl53l0x.final_period_write(d, 14))
+    test.assert_eq(reg_of(c, 0, 0x48), 0x48)
+    test.assert_eq(reg_of(c, 0, 0x47), 0x08)
+    test.assert_eq(reg_of(c, 0, 0x32), 3)
+    test.assert_eq(reg_of(c, 0, 0x30), 0x07)
+    test.assert_eq(reg_of(c, 1, 0x30), 0x20)
+    test.assert_eq(reg_of(c, 0, 0x70), 6)
+    test.assert(vl53l0x.vcsel_read(d, true) == Some(14))
+    test.assert_eq(reg_of(c, 0, 0x01), 0xE8)
+    test.assert_eq(at(c.st, 40), 0)
+
+@test
+fn test_every_final_range_period_is_taken_and_another_is_refused() [io, hw]
+    for pclks in [8, 10, 12, 14]
+        let c = chip()
+        put(c, 0x01, 0xE8)
+        let d = dut(c)
+        test.assert(vl53l0x.final_period_write(d, pclks))
+        test.assert(vl53l0x.vcsel_read(d, true) == Some(pclks))
+    let c2 = chip()
+    test.assert(not vl53l0x.final_period_write(dut(c2), 9))
+    c2.st.insert(4, 0)
+    test.assert(not vl53l0x.final_period_write(dut(c2), 10))
+
+@test
+fn test_a_failed_final_range_write_leaves_the_page_register_at_zero() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let ok = chip()
+    put(ok, 0x01, 0xE8)
+    test.assert(vl53l0x.final_period_write(dut(ok), 12))
+    let total = at(ok.st, 1)
+    for n in 1..(total + 1)
+        let c2 = chip()
+        put(c2, 0x01, 0xE8)
+        c2.st.insert(2, n)
+        let r = vl53l0x.final_period_write(dut(c2), 12)
+        if not r
+            // The transaction that failed may be the page write itself;
+            // whatever else failed, a later write back to page 0 was tried.
+            test.assert(at(c2.st, 40) == 0 or at(c2.st, 2) == n)
+
+// ── The calibration ──────────────────────────────────────────────────
+
+@test
+fn test_one_calibration_starts_waits_clears_and_stops() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.calibrate_once(d, 0x40))
+    log_is(c, [1, 0x00, 0x41, -1, 2, 0x13, 1, -1, 2, 0x13, 1, -1, 1, 0x0B, 1, -1, 1, 0x00, 0x00, -1])
+
+@test
+fn test_a_calibration_that_never_ends_times_out() [io, hw]
+    let c = chip()
+    c.st.insert(21, 1)
+    let d = dut(c)
+    test.assert(not vl53l0x.calibrate_once(d, 0x00))
+    test.assert(at(c.st, 0) >= 100)
+
+@test
+fn test_the_phase_calibration_puts_the_sequence_back() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    test.assert(vl53l0x.phase_calibrate(d))
+    test.assert_eq(reg_of(c, 0, 0x01), 0xE8)
+    let c2 = chip()
+    put(c2, 0x01, 0xE8)
+    c2.st.insert(21, 1)
+    test.assert(not vl53l0x.phase_calibrate(dut(c2)))
+    test.assert_eq(reg_of(c2, 0, 0x01), 0xE8)
+    c2.st.insert(4, 0)
+    test.assert(not vl53l0x.phase_calibrate(dut(c2)))
+
+@test
+fn test_the_reference_calibration_is_vhv_then_phase_then_the_sequence_back() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.ref_calibrate(d))
+    test.assert_eq(reg_of(c, 0, 0x01), 0xE8)
+    log_is(c, [1, 0x01, 0x01, -1, 1, 0x00, 0x41, -1, 2, 0x13, 1, -1, 2, 0x13, 1, -1, 1, 0x0B, 1, -1, 1, 0x00, 0x00, -1, 1, 0x01, 0x02, -1, 1, 0x00, 0x01, -1, 2, 0x13, 1, -1, 2, 0x13, 1, -1, 1, 0x0B, 1, -1, 1, 0x00, 0x00, -1, 1, 0x01, 0xE8, -1])
+
+@test
+fn test_the_reference_calibration_fails_in_each_step() [io, hw]
+    let c = chip()
+    c.st.insert(21, 1)
+    test.assert(not vl53l0x.ref_calibrate(dut(c)))
+    // The VHV step passes and the phase step does not: the result arrives
+    // for the first start only.
+    let c2 = chip()
+    let total = at(c.st, 1)
+    test.assert(vl53l0x.ref_calibrate(dut(c2)))
+    let n = at(c2.st, 1)
+    for k in 1..(n + 1)
+        let c3 = chip()
+        c3.st.insert(2, k)
+        test.assert(not vl53l0x.ref_calibrate(dut(c3)))
+
+// ── The initialisation ───────────────────────────────────────────────
+
+@test
+fn test_the_data_initialisation_reads_the_stop_variable_from_page_1() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.data_init(d, true) == Some(0x3C))
+    test.assert_eq(reg_of(c, 0, 0x89) & 1, 1)
+    test.assert_eq(reg_of(c, 0, 0x88), 0)
+    test.assert_eq(reg_of(c, 0, 0x60) & 0x12, 0x12)
+    test.assert_eq(reg_of(c, 0, 0x44), 0x00)
+    test.assert_eq(reg_of(c, 0, 0x45), 0x20)
+    test.assert_eq(reg_of(c, 0, 0x01), 0xFF)
+    test.assert_eq(at(c.st, 40), 0)
+    test.assert_eq(reg_of(c, 0, 0x80) + at(c.regs, 0x80), 0)
+
+@test
+fn test_io_at_1_8_v_leaves_the_pad_register_alone() [io, hw]
+    let c = chip()
+    put(c, 0x89, 0x00)
+    let d = dut(c)
+    test.assert(vl53l0x.data_init(d, false) == Some(0x3C))
+    test.assert_eq(reg_of(c, 0, 0x89), 0)
+
+@test
+fn test_the_data_initialisation_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l0x.data_init(dut(c), true) != None)
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(vl53l0x.data_init(dut(c2), true) == None)
+        // The pages are left as soon as the bus lets them be.
+        test.assert(at(c2.st, 40) == 0 or k <= n)
+
+@test
+fn test_the_spad_info_is_the_count_and_the_type_from_page_7() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.spad_info(d) == Some(0x85))
+    test.assert_eq(at(c.st, 40), 0)
+    test.assert_eq(at(c.regs, 0x80), 0)
+    test.assert_eq(reg_of(c, 6, 0x83) & 0x04, 0)
+
+@test
+fn test_a_spad_handshake_that_never_ends_is_a_timeout_and_the_pages_are_left() [io, hw]
+    let c = chip()
+    c.st.insert(11, 1)
+    let d = dut(c)
+    test.assert(vl53l0x.spad_info(d) == None)
+    test.assert(at(c.st, 0) >= 100)
+    // The fix kept: the page register is back at 0, the pages are
+    // powered down, and the bit set on page 6 is cleared.
+    test.assert_eq(at(c.st, 40), 0)
+    test.assert_eq(at(c.regs, 0x80), 0)
+    test.assert_eq(reg_of(c, 6, 0x83) & 0x04, 0)
+    test.assert_eq(reg_of(c, 7, 0x81), 0)
+
+@test
+fn test_the_spad_info_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l0x.spad_info(dut(c)) != None)
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(vl53l0x.spad_info(dut(c2)) == None)
+
+@test
+fn test_the_aperture_spads_start_at_12_and_the_count_is_enabled_from_there() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.ref_spads_apply(d, 5, true))
+    test.assert_eq(reg_of(c, 0, 0xB0), 0x00)
+    test.assert_eq(reg_of(c, 0, 0xB1), 0xF0)
+    test.assert_eq(reg_of(c, 0, 0xB2), 0x01)
+    test.assert_eq(reg_of(c, 0, 0xB3), 0x00)
+    test.assert_eq(reg_of(c, 0, 0xB5), 0x00)
+    test.assert_eq(reg_of(c, 1, 0x4F), 0x00)
+    test.assert_eq(reg_of(c, 1, 0x4E), 0x2C)
+    test.assert_eq(reg_of(c, 0, 0xB6), 0xB4)
+    test.assert_eq(at(c.st, 40), 0)
+
+@test
+fn test_the_non_aperture_spads_start_at_0() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.ref_spads_apply(d, 10, false))
+    test.assert_eq(reg_of(c, 0, 0xB0), 0xFF)
+    test.assert_eq(reg_of(c, 0, 0xB1), 0x03)
+    test.assert_eq(reg_of(c, 0, 0xB2), 0x00)
+
+@test
+fn test_only_the_spads_the_part_has_are_enabled() [io, hw]
+    let c = chip()
+    put(c, 0xB0, 0x0F)
+    put(c, 0xB1, 0x00)
+    put(c, 0xB2, 0x00)
+    put(c, 0xB3, 0x00)
+    put(c, 0xB4, 0x00)
+    put(c, 0xB5, 0x00)
+    let d = dut(c)
+    test.assert(vl53l0x.ref_spads_apply(d, 20, false))
+    test.assert_eq(reg_of(c, 0, 0xB0), 0x0F)
+    test.assert_eq(reg_of(c, 0, 0xB1), 0x00)
+    test.assert(vl53l0x.ref_spads_apply(d, 0, false))
+    test.assert_eq(reg_of(c, 0, 0xB0), 0x00)
+
+@test
+fn test_the_spad_map_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l0x.ref_spads_apply(dut(c), 5, true))
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(not vl53l0x.ref_spads_apply(dut(c2), 5, true))
+
+@test
+fn test_the_tuning_table_is_the_80_pairs_of_the_api_in_order() [io, hw]
+    test.assert_eq(vl53l0x.TUNING.len(), 160)
+    test.assert_eq(vl53l0x.TUNING_PAIRS, 80)
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.tuning_load(d))
+    test.assert_eq(at(c.st, 99), 80 * 4)
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 1), 0xFF)
+    test.assert_eq(at(c.log, 2), 0x01)
+    test.assert_eq(at(c.log, 4 * 79 + 1), 0x80)
+    test.assert_eq(at(c.log, 4 * 79 + 2), 0x00)
+    test.assert_eq(at(c.log, 4 * 78 + 1), 0xFF)
+    test.assert_eq(at(c.log, 4 * 78 + 2), 0x00)
+    test.assert_eq(at(c.st, 40), 0)
+
+@test
+fn test_the_tuning_table_stops_at_the_first_failed_write() [io, hw]
+    let c = chip()
+    c.st.insert(2, 7)
+    test.assert(not vl53l0x.tuning_load(dut(c)))
+    test.assert_eq(at(c.st, 1), 7)
+
+@test
+fn test_gpio1_is_configured_for_new_sample_ready_active_low() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.gpio_config(d))
+    test.assert_eq(reg_of(c, 0, 0x0A), 0x04)
+    test.assert_eq(reg_of(c, 0, 0x84), 0x00)
+    log_is(c, [1, 0x0A, 0x04, -1, 2, 0x84, 1, -1, 1, 0x84, 0x00, -1, 1, 0x0B, 0x01, -1])
+
+@test
+fn test_start_brings_the_part_up_and_hands_back_the_stop_variable() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    let Some(s) = vl53l0x.start(d, true) else
+        test.assert(false)
+        return
+    test.assert_eq(s.stop_var, 0x3C)
+    test.assert(not s.continuous)
+    test.assert_eq(reg_of(c, 0, 0x01), 0xE8)
+    test.assert_eq(reg_of(c, 0, 0x45), 0x20)
+    test.assert_eq(reg_of(c, 0, 0xB1), 0xF0)
+    test.assert_eq(reg_of(c, 0, 0x0A), 0x04)
+    test.assert_eq(reg_of(c, 0, 0x89) & 1, 1)
+    test.assert_eq(at(c.st, 40), 0)
+    test.assert_eq(at(c.regs, 0x80), 0)
+    // MSRC and TCC are off, DSS stays on, so the budget is the one the
+    // part came up with.
+    test.assert(vl53l0x.budget_read(d) != None)
+
+@test
+fn test_start_refuses_a_part_that_is_not_a_vl53l0x() [io, hw]
+    let c = chip()
+    put(c, 0xC0, 0x41)
+    test.assert(vl53l0x.start(dut(c), true) == None)
+    test.assert_eq(at(c.st, 1), 1)
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(vl53l0x.start(dut(c2), true) == None)
+
+@test
+fn test_start_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l0x.start(dut(c), true) != None)
+    let n = at(c.st, 1)
+    test.assert(n > 150)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(vl53l0x.start(dut(c2), true) == None)
+
+@test
+fn test_start_fails_when_the_spad_handshake_or_a_calibration_never_ends() [io, hw]
+    let c = chip()
+    c.st.insert(11, 1)
+    test.assert(vl53l0x.start(dut(c), true) == None)
+    let c2 = chip()
+    c2.st.insert(21, 1)
+    test.assert(vl53l0x.start(dut(c2), true) == None)
+
+@test
+fn test_the_shutdown_pin_is_cycled_with_the_booting_time_after_each_edge() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.setup())
+    test.assert(vl53l0x.reset_cycle(d))
+    test.assert_eq(at(d.pins.sets, 0), 2)
+    test.assert_eq(at(d.pins.sets, 1), 80)
+    test.assert_eq(at(d.pins.sets, 2), 81)
+    test.assert(at(d.pins.sets, 101) - at(d.pins.sets, 100) >= 2)
+    test.assert(at(c.st, 0) >= 4)
+    test.assert(not vl53l0x.reset_cycle(dut_plain(chip())))
+
+@test
+fn test_bring_up_makes_the_bus_ready_cycles_the_pin_and_starts() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.bring_up(d, true) != None)
+    test.assert_eq(at(c.st, 31), 400000)
+    test.assert_eq(at(d.pins.sets, 0), 2)
+    let plain = dut_plain(chip())
+    test.assert(vl53l0x.bring_up(plain, false) != None)
+    test.assert_eq(at(plain.pins.sets, 0), 0)
+    let spi = Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: DeviceWiring { bus: 0, addr: None, cs: Some(3), irq: None, en: None } }
+    test.assert(vl53l0x.bring_up(spi, true) == None)
+
+// ── Measurements ─────────────────────────────────────────────────────
+
+@test
+fn test_the_stop_variable_is_written_back_through_page_1() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.stop_var_restore(d, 0x3C))
+    log_is(c, [1, 0x80, 1, -1, 1, 0xFF, 1, -1, 1, 0x00, 0, -1, 1, 0x91, 0x3C, -1, 1, 0x00, 1, -1, 1, 0xFF, 0, -1, 1, 0x80, 0, -1])
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(not vl53l0x.stop_var_restore(dut(c2), 0x3C))
+
+@test
+fn test_a_single_shot_clears_the_old_flag_restores_the_variable_then_starts() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.single_start(d, 0x3C))
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 1), 0x0B)
+    test.assert_eq(at(c.log, at(c.st, 99) - 3), 0x00)
+    test.assert_eq(at(c.log, at(c.st, 99) - 2), 0x01)
+    test.assert_eq(at(c.st, 23), 1)
+
+@test
+fn test_a_single_shot_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l0x.single_start(dut(c), 0x3C))
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(not vl53l0x.single_start(dut(c2), 0x3C))
+
+@test
+fn test_back_to_back_ranging_starts_with_mode_2() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.continuous_start(d, 0x3C, 0))
+    test.assert_eq(reg_of(c, 0, 0x00), 0x02)
+
+@test
+fn test_timed_ranging_writes_the_period_in_oscillator_ticks() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    // With no calibrated oscillator value the period is in milliseconds.
+    test.assert(vl53l0x.continuous_start(d, 0x3C, 100))
+    test.assert_eq(reg_of(c, 0, 0x04), 0)
+    test.assert_eq(reg_of(c, 0, 0x07), 100)
+    test.assert_eq(reg_of(c, 0, 0x00), 0x04)
+    let c2 = chip()
+    put(c2, 0xF8, 0x01)
+    put(c2, 0xF9, 0x2C)
+    test.assert(vl53l0x.continuous_start(dut(c2), 0x3C, 100))
+    // 100 ms at 300 ticks a millisecond is 30000, 0x7530.
+    test.assert_eq(reg_of(c2, 0, 0x06), 0x75)
+    test.assert_eq(reg_of(c2, 0, 0x07), 0x30)
+
+@test
+fn test_continuous_ranging_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    put(c, 0xF8, 0x01)
+    put(c, 0xF9, 0x2C)
+    test.assert(vl53l0x.continuous_start(dut(c), 0x3C, 50))
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        put(c2, 0xF8, 0x01)
+        put(c2, 0xF9, 0x2C)
+        c2.st.insert(2, k)
+        test.assert(not vl53l0x.continuous_start(dut(c2), 0x3C, 50))
+    let c3 = chip()
+    test.assert(vl53l0x.continuous_start(dut(c3), 0x3C, 0))
+    let m = at(c3.st, 1)
+    for k in 1..(m + 1)
+        let c4 = chip()
+        c4.st.insert(2, k)
+        test.assert(not vl53l0x.continuous_start(dut(c4), 0x3C, 0))
+
+@test
+fn test_stopping_continuous_ranging_selects_single_shot_and_zeroes_the_variable() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.continuous_stop(d))
+    log_is(c, [1, 0x00, 0x01, -1, 1, 0xFF, 0x01, -1, 1, 0x00, 0x00, -1, 1, 0x91, 0x00, -1, 1, 0x00, 0x01, -1, 1, 0xFF, 0x00, -1])
+    test.assert_eq(reg_of(c, 1, 0x91), 0)
+    let c2 = chip()
+    c2.st.insert(2, 3)
+    test.assert(not vl53l0x.continuous_stop(dut(c2)))
+
+@test
+fn test_a_result_is_waiting_when_the_low_bits_of_the_status_are_set() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(not vl53l0x.result_ready(d))
+    put(c, 0x13, 0x04)
+    test.assert(vl53l0x.result_ready(d))
+    put(c, 0x13, 0x20)
+    test.assert(not vl53l0x.result_ready(d))
+    c.st.insert(4, 0)
+    test.assert(not vl53l0x.result_ready(d))
+
+// ── The range status ─────────────────────────────────────────────────
+
+@test
+fn test_the_device_codes_map_to_statuses_as_st_maps_them() [io, hw]
+    test.assert(vl53l0x.status_of_code(11) == RangeStatus.RangeValid)
+    test.assert(vl53l0x.status_of_code(4) == RangeStatus.RangeWeak)
+    for n in [6, 9, 8, 10]
+        test.assert(vl53l0x.status_of_code(n) == RangeStatus.RangeOutOfRange)
+    for n in [1, 2, 3]
+        test.assert(vl53l0x.status_of_code(n) == RangeStatus.RangeFault)
+    for n in [0, 5, 7, 12, 13, 14, 15]
+        test.assert(vl53l0x.status_of_code(n) == RangeStatus.RangeNoTarget)
+
+@test
+fn test_a_good_range_is_valid_with_its_distance() [io, hw]
+    let r = vl53l0x.reading_of(code(11), 523)
+    test.assert_eq(r.mm, 523)
+    test.assert(r.status == RangeStatus.RangeValid)
+    let w = vl53l0x.reading_of(code(4), 1180)
+    test.assert_eq(w.mm, 1180)
+    test.assert(w.status == RangeStatus.RangeWeak)
+
+@test
+fn test_8190_mm_is_out_of_range_whatever_the_code() [io, hw]
+    let r = vl53l0x.reading_of(code(11), 8190)
+    test.assert_eq(r.mm, 0)
+    test.assert(r.status == RangeStatus.RangeOutOfRange)
+    let r2 = vl53l0x.reading_of(code(4), 8191)
+    test.assert(r2.status == RangeStatus.RangeOutOfRange)
+    let r3 = vl53l0x.reading_of(code(11), 8189)
+    test.assert(r3.status == RangeStatus.RangeValid)
+
+@test
+fn test_a_status_without_a_distance_reads_zero_millimetres() [io, hw]
+    let f = vl53l0x.reading_of(code(2), 1234)
+    test.assert_eq(f.mm, 0)
+    test.assert(f.status == RangeStatus.RangeFault)
+    let n = vl53l0x.reading_of(code(0), 1234)
+    test.assert_eq(n.mm, 0)
+    test.assert(n.status == RangeStatus.RangeNoTarget)
+
+@test
+fn test_the_other_bits_of_the_status_byte_are_ignored() [io, hw]
+    let r = vl53l0x.reading_of(code(11) | 0x87, 100)
+    test.assert(r.status == RangeStatus.RangeValid)
+
+@test
+fn test_a_result_is_twelve_bytes_in_one_read_and_clears_the_interrupt() [io, hw]
+    let c = chip()
+    put_result(c, code(11), 0x0123)
+    let d = dut(c)
+    let r = vl53l0x.result_read(d)
+    test.assert_eq(mm_of(r), 291)
+    test.assert(status_of(r) == RangeStatus.RangeValid)
+    log_is(c, [2, 0x14, 12, -1, 1, 0x0B, 1, -1])
+
+@test
+fn test_a_result_read_that_fails_is_none() [io, hw]
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(vl53l0x.result_read(dut(c)) == None)
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(vl53l0x.result_read(dut(c2)) == None)
+
+@test
+fn test_waiting_for_a_result_polls_then_reads() [io, hw]
+    let c = chip()
+    c.st.insert(23, 1)
+    c.st.insert(22, 3)
+    put_result(c, code(11), 700)
+    let d = dut(c)
+    test.assert_eq(mm_of(vl53l0x.result_wait(d)), 700)
+
+@test
+fn test_waiting_for_a_result_gives_up_after_1_1_s() [io, hw]
+    let c = chip()
+    c.st.insert(23, 1)
+    c.st.insert(21, 1)
+    let d = dut(c)
+    test.assert(vl53l0x.result_wait(d) == None)
+    test.assert(at(c.st, 0) >= 1100)
+
+@test
+fn test_one_measurement_starts_waits_and_reads() [io, hw]
+    let c = chip()
+    put_result(c, code(11), 412)
+    let d = dut(c)
+    test.assert_eq(mm_of(vl53l0x.measure(d, 0x3C)), 412)
+    c.st.insert(4, 0)
+    test.assert(vl53l0x.measure(d, 0x3C) == None)
+
+@test
+fn test_the_longest_distance_follows_the_vcsel_periods() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l0x.max_mm_of(d), 1200)
+    put(c, 0x50, 8)
+    put(c, 0x70, 6)
+    test.assert_eq(vl53l0x.max_mm_of(d), 2000)
+    put(c, 0x70, 5)
+    test.assert_eq(vl53l0x.max_mm_of(d), 1200)
+    c.st.insert(4, 0)
+    test.assert_eq(vl53l0x.max_mm_of(d), 1200)
+
+@test
+fn test_range_start_answers_the_budget_or_zero_while_continuous() [io, hw]
+    let c = chip()
+    put(c, 0x01, 0xE8)
+    let d = dut(c)
+    let st = Vl53State { stop_var: 0x3C, continuous: false }
+    test.assert_eq(vl53l0x.range_start_of(d, st), 31046)
+    test.assert_eq(vl53l0x.range_start_of(d, Vl53State { stop_var: 0x3C, continuous: true }), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(vl53l0x.range_start_of(d, st), -1)
+    let c2 = chip()
+    c2.st.insert(2, 6)
+    test.assert_eq(vl53l0x.range_start_of(dut(c2), st), -1)
+
+// ── The profiles ─────────────────────────────────────────────────────
+
+@tier(app)
+fn started() -> Chip
+    let c = chip()
+    let ok = vl53l0x.start(dut(c), true)
+    test.assert(ok != None)
+    log_clear(c)
+    c.st.insert(1, 0)
+    c
+
+@test
+fn test_the_default_profile_is_33_ms_at_0_25_mcps() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53Default))
+    test.assert(vl53l0x.limit_read(d) == Some(250))
+    let b = vl53l0x.budget_read(d) ?? 0
+    test.assert(abs(b - 33000) < 200)
+    test.assert(vl53l0x.vcsel_read(d, false) == Some(14))
+    test.assert(vl53l0x.vcsel_read(d, true) == Some(10))
+
+@test
+fn test_the_high_accuracy_profile_is_200_ms_at_0_25_mcps() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53HighAccuracy))
+    test.assert(vl53l0x.limit_read(d) == Some(250))
+    let b = vl53l0x.budget_read(d) ?? 0
+    test.assert(abs(b - 200000) < 2000)
+
+@test
+fn test_the_high_speed_profile_is_20_ms_at_0_25_mcps() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53HighSpeed))
+    let b = vl53l0x.budget_read(d) ?? 0
+    test.assert(abs(b - 20000) < 100)
+
+@test
+fn test_the_long_range_profile_is_18_and_14_pclks_at_0_1_mcps_and_33_ms() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53LongRange))
+    test.assert(vl53l0x.vcsel_read(d, false) == Some(18))
+    test.assert(vl53l0x.vcsel_read(d, true) == Some(14))
+    test.assert(vl53l0x.limit_read(d) == Some(93))
+    let b = vl53l0x.budget_read(d) ?? 0
+    test.assert(abs(b - 33000) < 300)
+    test.assert_eq(vl53l0x.max_mm_of(d), 2000)
+
+@test
+fn test_leaving_long_range_puts_the_periods_back() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53LongRange))
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53HighSpeed))
+    test.assert(vl53l0x.vcsel_read(d, false) == Some(14))
+    test.assert(vl53l0x.vcsel_read(d, true) == Some(10))
+    test.assert_eq(vl53l0x.max_mm_of(d), 1200)
+
+@test
+fn test_a_profile_that_keeps_the_periods_does_not_run_a_calibration() [io, hw]
+    let c = started()
+    let d = dut(c)
+    test.assert(vl53l0x.profile_apply(d, Vl53Profile.Vl53HighSpeed))
+    test.assert_eq(at(c.st, 23), 0)
+    test.assert_eq(at(c.regs, 0), 0)
+
+@test
+fn test_a_profile_fails_on_any_one_failed_transaction() [io, hw]
+    let c = started()
+    test.assert(vl53l0x.profile_apply(dut(c), Vl53Profile.Vl53LongRange))
+    let n = at(c.st, 1)
+    for k in 1..(n + 1)
+        let c2 = started()
+        c2.st.insert(2, k)
+        test.assert(not vl53l0x.profile_apply(dut(c2), Vl53Profile.Vl53LongRange))
+
+// ── The types and the helpers that carry the state ───────────────────
+
+@test
+fn test_the_state_helpers() [io, hw]
+    let d = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert_eq(d.st.stop_var, 0)
+    let up = vl53l0x.with_started(d, Some(Vl53State { stop_var: 0x3C, continuous: false }))
+    test.assert_eq(up.st.stop_var, 0x3C)
+    let same = vl53l0x.with_started(up, None)
+    test.assert_eq(same.st.stop_var, 0x3C)
+    let on = vl53l0x.with_continuous(up, true, true)
+    test.assert(on.st.continuous)
+    test.assert_eq(on.st.stop_var, 0x3C)
+    let still = vl53l0x.with_continuous(up, false, true)
+    test.assert(not still.st.continuous)
+    let off = vl53l0x.with_continuous(on, true, false)
+    test.assert(not off.st.continuous)
+    let moved = vl53l0x.with_addr(up, true, 0x30)
+    test.assert(moved.w.addr == Some(0x30))
+    test.assert(moved.w.irq == Some(7))
+    test.assert(moved.w.en == Some(8))
+    test.assert_eq(moved.st.stop_var, 0x3C)
+    let stayed = vl53l0x.with_addr(up, false, 0x30)
+    test.assert(stayed.w.addr == Some(0x29))
+
+@test
+fn test_moving_the_address_writes_0x8a_and_the_part_answers_there() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.wr(d, 0x8A, 0x30))
+    test.assert_eq(at(c.st, 30), 0x30)
+    test.assert(vl53l0x.rd(d, 0xC0) == None)
+    let moved = Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: dev_bus.wiring_i2c(0, 0x30) }
+    test.assert(vl53l0x.model_ok(moved))
+
+// ── The type over the host's board handles ───────────────────────────
+//
+// The host's I2C bus is absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// type that forward to the functions above.
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw]
+    var p = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(not p.begin())
+    test.assert(not p.begin_io(false))
+    test.assert(p.reg(0xC0) == None)
+    test.assert(not p.set_profile(Vl53Profile.Vl53Default))
+    test.assert_eq(p.timing_budget_us(), 0)
+    test.assert(not p.set_timing_budget_us(33000))
+    test.assert_eq(p.signal_rate_limit_mmcps(), -1)
+    test.assert(not p.set_signal_rate_limit_mmcps(250))
+    test.assert_eq(p.vcsel_period(true), 0)
+    test.assert(not p.continuous_begin(0))
+    test.assert(not p.continuous_end())
+    test.assert(p.measure_now() == None)
+    test.assert(not p.data_ready())
+    test.assert(not p.move_to(0x30))
+    test.assert_eq(p.gpio1_level(), 0)
+    test.assert_eq(p.range_start(), -1)
+    test.assert(p.range_read() == None)
+    test.assert_eq(p.range_max_mm(), 1200)
+    test.assert(p.device_id() == None)
+    test.assert(p.range_read_after(10, 20) == None)
+
+@test
+fn test_the_type_without_a_shutdown_pin_over_absent_hardware() [io, hw]
+    var p = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring_plain())
+    test.assert(not p.begin())
+    test.assert_eq(p.gpio1_level(), -1)

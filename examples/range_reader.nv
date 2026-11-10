@@ -1,0 +1,87 @@
+/* range_reader.nv: a reading loop that prints the distance a VL53L0X
+ * time-of-flight sensor measures, about ten times a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          vl53l0x-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The sensor is a VL53L0X on a breakout (Adafruit 3317, Pololu 2490,
+ * Seeed Grove): SDA and SCL to the board's first I2C bus, power to 3.3 V
+ * and ground, and XSHUT and GPIO1 left open or wired to pins 28 and 29 of
+ * the board's GPIO, which this program does not use.  The part answers at
+ * 0x29.  A line looks like
+ *
+ *     range 523 mm
+ *     out of range
+ *
+ * The program reads the sensor through devices-nv's Rangefinder trait:
+ * `range_start` starts a single measurement and answers the time it takes
+ * in microseconds, and `range_read` waits for the result and answers the
+ * distance with the status ST's API gives it.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints "no answer"
+ * until a board package names one with `@hal(i2c)`.  The sensor has not
+ * been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer }
+use dev_range.{ RangeReading, Rangefinder }
+use dev_bus
+use vl53l0x.{ Vl53l0x, Vl53Profile }
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would
+// allocate, which @tier(embedded) refuses, so each digit goes out as a
+// byte.  An Int has at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes the line for a reading.
+@tier(embedded)
+fn report(r: RangeReading) [hw]
+    match r.status
+        RangeValid =>
+            hal.uart.write("range ")
+            digits(r.mm)
+            hal.uart.write(" mm\n")
+        RangeWeak =>
+            hal.uart.write("weak ")
+            digits(r.mm)
+            hal.uart.write(" mm\n")
+        RangeOutOfRange => hal.uart.write("out of range\n")
+        RangeNoTarget => hal.uart.write("no target\n")
+        RangeFault => hal.uart.write("sensor fault\n")
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    var sensor = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 },
+                                dev_bus.wiring_i2c(0, 0x29))
+    // The sensor needs 1.2 ms after its supply; the program waits 5.
+    hal.timer.delay_ms(5)
+    if not sensor.begin()
+        hal.uart.write("no answer from the sensor at 0x29\n")
+    let _ = sensor.set_profile(Vl53Profile.Vl53Default)
+    while true
+        if sensor.range_start() < 0
+            hal.uart.write("no answer\n")
+        else
+            match sensor.range_read()
+                Some(r) => report(r)
+                None => hal.uart.write("no answer\n")
+        hal.timer.delay_ms(100)
