@@ -926,6 +926,30 @@ fn test_gpio1_is_configured_for_new_sample_ready_active_low() [io, hw]
     log_is(c, [1, 0x0A, 0x04, -1, 2, 0x84, 1, -1, 1, 0x84, 0x00, -1, 1, 0x0B, 0x01, -1])
 
 @test
+fn test_the_static_initialisation_loads_the_spads_the_tuning_and_the_gpio_then_the_budget() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.static_init(d))
+    test.assert_eq(reg_of(c, 0, 0x0A), 0x04)
+    test.assert_eq(reg_of(c, 0, 0x01), 0xE8)
+    test.assert_eq(at(c.st, 40), 0)
+    test.assert(vl53l0x.budget_read(d) != None)
+
+@test
+fn test_the_static_initialisation_fails_on_any_one_failed_transaction() [io, hw]
+    let c = chip()
+    test.assert(vl53l0x.static_init(dut(c)))
+    let n = at(c.st, 1)
+    test.assert(n > 100)
+    for k in 1..(n + 1)
+        let c2 = chip()
+        c2.st.insert(2, k)
+        test.assert(not vl53l0x.static_init(dut(c2)))
+    let c3 = chip()
+    c3.st.insert(11, 1)
+    test.assert(not vl53l0x.static_init(dut(c3)))
+
+@test
 fn test_start_brings_the_part_up_and_hands_back_the_stop_variable() [io, hw]
     let c = chip()
     let d = dut(c)
@@ -1305,6 +1329,12 @@ fn test_a_profile_fails_on_any_one_failed_transaction() [io, hw]
 @test
 fn test_the_state_helpers() [io, hw]
     let d = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert_eq(d.st.stop_var, 0)
+    let kept = vl53l0x.with_state(d, Vl53State { stop_var: 0x55, continuous: true })
+    test.assert_eq(kept.st.stop_var, 0x55)
+    test.assert(kept.st.continuous)
+    test.assert(kept.w.addr == Some(0x29))
+    test.assert(kept.w.irq == Some(7))
     test.assert_eq(d.st.stop_var, 0)
     let up = vl53l0x.with_started(d, Some(Vl53State { stop_var: 0x3C, continuous: false }))
     test.assert_eq(up.st.stop_var, 0x3C)
