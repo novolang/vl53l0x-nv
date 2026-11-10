@@ -1370,3 +1370,14 @@ fn test_the_type_without_a_shutdown_pin_over_absent_hardware() [io, hw]
     var p = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring_plain())
     test.assert(not p.begin())
     test.assert_eq(p.gpio1_level(), -1)
+
+// A function written against the trait alone, called on a `let`.
+fn distance_of<R: Rangefinder>(r: R) -> ?RangeReading [hw]
+    if r.range_start() < 0
+        return None
+    r.range_read()
+
+@test
+fn test_a_function_over_the_trait_reads_the_sensor_through_a_plain_parameter() [io, hw]
+    let p = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(distance_of(p) == None)
