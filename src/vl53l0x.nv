@@ -92,62 +92,62 @@ use dev_range.{ RangeReading, RangeStatus, Rangefinder }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let SYSRANGE_START = 0x00
-let SYSTEM_SEQUENCE_CONFIG = 0x01
-let SYSTEM_INTERMEASUREMENT_PERIOD = 0x04
-let SYSTEM_INTERRUPT_CONFIG_GPIO = 0x0A
-let SYSTEM_INTERRUPT_CLEAR = 0x0B
-let RESULT_INTERRUPT_STATUS = 0x13
-let RESULT_RANGE_STATUS = 0x14
-let FINAL_RANGE_MIN_COUNT_RATE = 0x44
-let MSRC_CONFIG_TIMEOUT_MACROP = 0x46
-let FINAL_RANGE_VALID_PHASE_LOW = 0x47
-let FINAL_RANGE_VALID_PHASE_HIGH = 0x48
-let PRE_RANGE_VCSEL_PERIOD = 0x50
-let PRE_RANGE_TIMEOUT_MACROP = 0x51
-let PRE_RANGE_VALID_PHASE_LOW = 0x56
-let PRE_RANGE_VALID_PHASE_HIGH = 0x57
-let MSRC_CONFIG_CONTROL = 0x60
-let FINAL_RANGE_VCSEL_PERIOD = 0x70
-let FINAL_RANGE_TIMEOUT_MACROP = 0x71
-let GPIO_HV_MUX_ACTIVE_HIGH = 0x84
-let VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV = 0x89
-let I2C_SLAVE_DEVICE_ADDRESS = 0x8A
-let SPAD_ENABLES_REF = 0xB0
-let GLOBAL_CONFIG_REF_EN_START_SELECT = 0xB6
-let GLOBAL_CONFIG_VCSEL_WIDTH = 0x32
-let ALGO_PHASECAL_CONFIG_TIMEOUT = 0x30
-let ALGO_PHASECAL_LIM = 0x30
+let SYSRANGE_START                      = 0x00
+let SYSTEM_SEQUENCE_CONFIG              = 0x01
+let SYSTEM_INTERMEASUREMENT_PERIOD      = 0x04
+let SYSTEM_INTERRUPT_CONFIG_GPIO        = 0x0A
+let SYSTEM_INTERRUPT_CLEAR              = 0x0B
+let RESULT_INTERRUPT_STATUS             = 0x13
+let RESULT_RANGE_STATUS                 = 0x14
+let FINAL_RANGE_MIN_COUNT_RATE          = 0x44
+let MSRC_CONFIG_TIMEOUT_MACROP          = 0x46
+let FINAL_RANGE_VALID_PHASE_LOW         = 0x47
+let FINAL_RANGE_VALID_PHASE_HIGH        = 0x48
+let PRE_RANGE_VCSEL_PERIOD              = 0x50
+let PRE_RANGE_TIMEOUT_MACROP            = 0x51
+let PRE_RANGE_VALID_PHASE_LOW           = 0x56
+let PRE_RANGE_VALID_PHASE_HIGH          = 0x57
+let MSRC_CONFIG_CONTROL                 = 0x60
+let FINAL_RANGE_VCSEL_PERIOD            = 0x70
+let FINAL_RANGE_TIMEOUT_MACROP          = 0x71
+let GPIO_HV_MUX_ACTIVE_HIGH             = 0x84
+let VHV_CONFIG_PAD_SCL_SDA_EXTSUP_HV    = 0x89
+let I2C_SLAVE_DEVICE_ADDRESS            = 0x8A
+let SPAD_ENABLES_REF                    = 0xB0
+let GLOBAL_CONFIG_REF_EN_START_SELECT   = 0xB6
+let GLOBAL_CONFIG_VCSEL_WIDTH           = 0x32
+let ALGO_PHASECAL_CONFIG_TIMEOUT        = 0x30
+let ALGO_PHASECAL_LIM                   = 0x30
 let DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD = 0x4E
-let DYNAMIC_SPAD_REF_EN_START_OFFSET = 0x4F
-let IDENTIFICATION_MODEL_ID = 0xC0
-let IDENTIFICATION_REVISION_ID = 0xC2
-let OSC_CALIBRATE_VAL = 0xF8
-let PAGE = 0xFF
-let POWER_PAGES = 0x80
-let STOP_VARIABLE = 0x91
+let DYNAMIC_SPAD_REF_EN_START_OFFSET    = 0x4F
+let IDENTIFICATION_MODEL_ID             = 0xC0
+let IDENTIFICATION_REVISION_ID          = 0xC2
+let OSC_CALIBRATE_VAL                   = 0xF8
+let PAGE                                = 0xFF
+let POWER_PAGES                         = 0x80
+let STOP_VARIABLE                       = 0x91
 
 // The model ID of Table 4.
 let MODEL_ID = 0xEE
 
 // The start modes of SYSRANGE_START.
-let START_SINGLE = 0x01
+let START_SINGLE       = 0x01
 let START_BACK_TO_BACK = 0x02
-let START_TIMED = 0x04
+let START_TIMED        = 0x04
 // The VHV calibration asks for bit 6 as well.
 let START_VHV = 0x40
 
 // The device-reported status codes in bits 6:3 of RESULT_RANGE_STATUS,
 // as ST's API names them.
-let CODE_VCSEL_CONTINUITY = 1
-let CODE_VCSEL_WATCHDOG = 2
-let CODE_NO_VHV = 3
-let CODE_MSRC_NO_TARGET = 4
-let CODE_RANGE_PHASE = 6
-let CODE_TCC = 8
+let CODE_VCSEL_CONTINUITY  = 1
+let CODE_VCSEL_WATCHDOG    = 2
+let CODE_NO_VHV            = 3
+let CODE_MSRC_NO_TARGET    = 4
+let CODE_RANGE_PHASE       = 6
+let CODE_TCC               = 8
 let CODE_PHASE_CONSISTENCY = 9
-let CODE_MIN_CLIP = 10
-let CODE_RANGE_COMPLETE = 11
+let CODE_MIN_CLIP          = 10
+let CODE_RANGE_COMPLETE    = 11
 
 // What the part reports for a target beyond what it can range: 8190 and
 // 8191 mm.
@@ -155,21 +155,21 @@ let OUT_OF_RANGE_MM = 8190
 
 // The bus clock, I2C fast mode (datasheet: 400 kbit/s), and the booting
 // time with margin (datasheet tBOOT 1.2 ms).
-let I2C_HZ = 400000
+let I2C_HZ  = 400000
 let BOOT_MS = 2
 
 // How long the driver waits: for the SPAD handshake and a reference
 // calibration, in milliseconds; for a result, 1100 ms, which is longer
 // than the 1 s the largest timing budget the driver allows.
-let SPAD_WAIT_MS = 100
-let CAL_WAIT_MS = 100
+let SPAD_WAIT_MS   = 100
+let CAL_WAIT_MS    = 100
 let RESULT_WAIT_MS = 1100
 
 // The default signal-rate limit, 0.25 MCPS, in thousandths of a MCPS
 // (the API's default for the final range); the register holds 9.7 fixed
 // point, so the limit is a multiple of 1/128 MCPS.
 let DEFAULT_LIMIT_MMCPS = 250
-let MAX_LIMIT_MMCPS = 511990
+let MAX_LIMIT_MMCPS     = 511990
 
 // The timing budget: the default the API starts from is about 33 ms; the
 // least the sequence can run in is 20 ms (UM2039, "Overall timing budget");
@@ -179,12 +179,12 @@ let MAX_BUDGET_US = 1000000
 
 // The overheads the API adds to the steps of the sequence, in
 // microseconds.
-let START_OVERHEAD = 1910
-let END_OVERHEAD = 960
-let MSRC_OVERHEAD = 660
-let TCC_OVERHEAD = 590
-let DSS_OVERHEAD = 690
-let PRE_RANGE_OVERHEAD = 660
+let START_OVERHEAD       = 1910
+let END_OVERHEAD         = 960
+let MSRC_OVERHEAD        = 660
+let TCC_OVERHEAD         = 590
+let DSS_OVERHEAD         = 690
+let PRE_RANGE_OVERHEAD   = 660
 let FINAL_RANGE_OVERHEAD = 550
 
 // The count of pairs in `TUNING`; a test checks it against the table.
@@ -213,8 +213,7 @@ pub const TUNING = [
     0x71, 0x01, 0x72, 0xFE, 0x76, 0x00, 0x77, 0x00,
     0xFF, 0x01, 0x0D, 0x01,
     0xFF, 0x00, 0x80, 0x01, 0x01, 0xF8,
-    0xFF, 0x01, 0x8E, 0x01, 0x00, 0x01, 0xFF, 0x00, 0x80, 0x00
-]
+    0xFF, 0x01, 0x8E, 0x01, 0x00, 0x01, 0xFF, 0x00, 0x80, 0x00]
 
 // The measurement profiles of UM2039, Table 6 and §§ 7.1 to 7.3.  The
 // default is the API's own; the other three change the signal-rate limit,
@@ -449,8 +448,7 @@ pub fn seq_read<P: Vl53l0xPort>(p: P) -> ?Seq [hw]
         msrc_us: mclks_to_us(msrc_reg + 1, pre_pclks),
         pre_us: mclks_to_us(pre_mclks, pre_pclks),
         fin_us: mclks_to_us(fin_mclks, fin_pclks),
-        pre_mclks: pre_mclks
-    })
+        pre_mclks: pre_mclks })
 
 // The time the enabled steps take besides the final range, in
 // microseconds: the start and end overheads and each step with its own.
@@ -882,15 +880,15 @@ pub fn profile_apply<P: Vl53l0xPort>(p: P, prof: Vl53Profile) -> Bool [hw]
     var limit = 250
     var budget = 33000
     match prof
-        Vl53Default =>
+        Vl53Default      =>
             budget = 33000
         Vl53HighAccuracy =>
             budget = 200000
-        Vl53LongRange =>
+        Vl53LongRange    =>
             pre = 18
             fin = 14
             limit = 100
-        Vl53HighSpeed =>
+        Vl53HighSpeed    =>
             budget = 20000
     let Some(cur_pre) = vcsel_read(p, false) else return false
     let Some(cur_fin) = vcsel_read(p, true) else return false
@@ -961,13 +959,21 @@ pub fn with_continuous(d: Vl53l0x, ok: Bool, on: Bool) -> Vl53l0x
 pub fn with_addr(d: Vl53l0x, ok: Bool, addr: Int) -> Vl53l0x
     if not ok
         return d
-    Vl53l0x { bus: d.bus, timer: d.timer, pins: d.pins, w: DeviceWiring { bus: d.w.bus, addr: Some(addr & 0x7F), cs: None, irq: d.w.irq, en: d.w.en }, st: d.st }
+    Vl53l0x { bus: d.bus,
+        timer: d.timer,
+        pins: d.pins,
+        w: DeviceWiring { bus: d.w.bus, addr: Some(addr & 0x7F), cs: None, irq: d.w.irq, en: d.w.en },
+        st: d.st }
 
 impl Vl53l0x
     // The part at `w.addr` on the board's I2C bus, as a board's device
     // table builds it.  Nothing is sent.
     fn attach(bus: BoardI2c, timer: BoardTimer, pins: BoardGpio, w: DeviceWiring) -> Vl53l0x
-        Vl53l0x { bus: bus, timer: timer, pins: pins, w: w, st: Vl53State { stop_var: 0, continuous: false } }
+        Vl53l0x { bus: bus,
+            timer: timer,
+            pins: pins,
+            w: w,
+            st: Vl53State { stop_var: 0, continuous: false } }
 
     // Brings the part up at 2.8 V I/O (`bring_up`), after a cycle of the
     // shutdown pin when the wiring has one.  Answers whether the part
