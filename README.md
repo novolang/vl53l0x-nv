@@ -277,6 +277,8 @@ which take the port: `vl53l0x.start(port, true)`,
 
 ## What is not included
 
+NOT IMPLEMENTED:
+
 - The offset calibration and the cross-talk calibration of the API
   (`VL53L0X_PerformOffsetCalibration`, `VL53L0X_PerformXTalkCalibration`)
   and the registers that hold their results. A part behind a cover glass
