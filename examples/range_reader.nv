@@ -66,6 +66,8 @@ fn report(r: RangeReading) [hw]
         RangeOutOfRange => hal.uart.write("out of range\n")
         RangeNoTarget   => hal.uart.write("no target\n")
         RangeFault      => hal.uart.write("sensor fault\n")
+        RangeBlinded    => hal.uart.write("blinded\n")
+        RangeSaturated  => hal.uart.write("saturated\n")
 
 @tier(embedded)
 fn main() [hw]
