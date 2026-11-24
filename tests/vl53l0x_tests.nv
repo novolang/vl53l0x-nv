@@ -26,7 +26,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_range.{ RangeReading, RangeStatus, Rangefinder }
 use dev_id.{ DeviceId, Identifiable }
 use vl53l0x
@@ -219,15 +219,21 @@ struct Dut
     c: Chip
     w: DeviceWiring
 
-impl Vl53l0xPort for Dut
-    fn setup(self) -> Bool [hw]
-        vl53l0x.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Dut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         vl53l0x.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        var src: DevBytes = Vec.new()
+        let _ = src.push((v & 0xFF) as u8)
+        vl53l0x.i2c_write_from(self.bus, self.w, reg, src)
+
     fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
         vl53l0x.i2c_write_from(self.bus, self.w, reg, src)
+
+impl Vl53l0xPort for Dut
+    fn setup(self) -> Bool [hw]
+        vl53l0x.i2c_setup(self.bus, self.pins, self.w)
 
     fn now_ms(self) -> Int [hw]
         at(self.c.st, 0)
@@ -236,7 +242,7 @@ impl Vl53l0xPort for Dut
         self.c.st.insert(0, at(self.c.st, 0) + ms)
 
     fn irq_level(self) -> Int [hw]
-        vl53l0x.irq_level_of(self.pins, self.w)
+        dev_bus.wiring_irq_level(self.pins, self.w)
 
     fn xshut(self, level: Int) -> Bool [hw]
         vl53l0x.xshut_of(self.pins, self.w, level)
@@ -350,36 +356,36 @@ fn test_gpio1_and_xshut_follow_the_wiring() [io, hw]
 fn test_one_two_and_four_byte_values_are_most_significant_byte_first() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(vl53l0x.wr(d, 0x30, 0x1AB))
+    test.assert(d.write_reg(0x30, 0x1AB))
     test.assert_eq(reg_of(c, 0, 0x30), 0xAB)
-    test.assert(vl53l0x.wr16(d, 0x31, 0x1234))
+    test.assert(d.write_reg16_be(0x31, 0x1234))
     test.assert_eq(reg_of(c, 0, 0x31), 0x12)
     test.assert_eq(reg_of(c, 0, 0x32), 0x34)
     test.assert(vl53l0x.wr32(d, 0x35, 0x01020304))
     test.assert_eq(reg_of(c, 0, 0x35), 0x01)
     test.assert_eq(reg_of(c, 0, 0x38), 0x04)
-    test.assert_eq(vl53l0x.rd(d, 0x30), Some(0xAB))
-    test.assert_eq(vl53l0x.rd16(d, 0x31), Some(0x1234))
-    test.assert(vl53l0x.rd(d, 0x77) == Some(0))
+    test.assert_eq(d.read_reg(0x30), Some(0xAB))
+    test.assert_eq(d.read_reg16_be(0x31), Some(0x1234))
+    test.assert(d.read_reg(0x77) == Some(0))
 
 @test
 fn test_a_part_that_does_not_answer_reads_as_none_and_writes_as_false() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = dut(c)
-    test.assert(vl53l0x.rd(d, 0xC0) == None)
-    test.assert(vl53l0x.rd16(d, 0xC0) == None)
-    test.assert(not vl53l0x.wr(d, 0x30, 1))
-    test.assert(not vl53l0x.upd(d, 0x30, 1, 1))
+    test.assert(d.read_reg(0xC0) == None)
+    test.assert(d.read_reg16_be(0xC0) == None)
+    test.assert(not d.write_reg(0x30, 1))
+    test.assert(not d.update_reg(0x30, 1, 1))
 
 @test
 fn test_upd_changes_the_bits_of_the_mask_and_keeps_the_others() [io, hw]
     let c = chip()
     put(c, 0x30, 0xA5)
     let d = dut(c)
-    test.assert(vl53l0x.upd(d, 0x30, 0x0F, 0x03))
+    test.assert(d.update_reg(0x30, 0x0F, 0x03))
     test.assert_eq(reg_of(c, 0, 0x30), 0xA3)
-    test.assert(vl53l0x.upd(d, 0x30, 0x80, 0x00))
+    test.assert(d.update_reg(0x30, 0x80, 0x00))
     test.assert_eq(reg_of(c, 0, 0x30), 0x23)
 
 @test
@@ -1463,9 +1469,9 @@ fn test_the_state_helpers() [io, hw]
 fn test_moving_the_address_writes_0x8a_and_the_part_answers_there() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(vl53l0x.wr(d, 0x8A, 0x30))
+    test.assert(d.write_reg(0x8A, 0x30))
     test.assert_eq(at(c.st, 30), 0x30)
-    test.assert(vl53l0x.rd(d, 0xC0) == None)
+    test.assert(d.read_reg(0xC0) == None)
     let moved = Dut { bus: FakeI2c { c: c }, pins: pins(c), c: c, w: dev_bus.wiring_i2c(0, 0x30) }
     test.assert(vl53l0x.model_ok(moved))
 
@@ -1515,3 +1521,22 @@ fn distance_of<R: Rangefinder>(r: R) -> ?RangeReading [hw]
 fn test_a_function_over_the_trait_reads_the_sensor_through_a_plain_parameter() [io, hw]
     let p = Vl53l0x.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, BoardGpio { id: 0 }, wiring())
     test.assert(distance_of(p) == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(vl53l0x.wr(d, 0x30, 0x1AB))
+    test.assert_eq(vl53l0x.rd(d, 0x30), d.read_reg(0x30))
+    test.assert(vl53l0x.wr16(d, 0x31, 0x1234))
+    test.assert_eq(vl53l0x.rd16(d, 0x31), d.read_reg16_be(0x31))
+    test.assert(vl53l0x.upd(d, 0x30, 0x0F, 0x03))
+    test.assert_eq(d.read_reg(0x30), Some(0xA3))
+
+@test
+fn test_the_deprecated_interrupt_level_answers_as_the_shared_function_does() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(vl53l0x.irq_level_of(d.pins, d.w), dev_bus.wiring_irq_level(d.pins, d.w))
