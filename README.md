@@ -86,7 +86,7 @@ fn main() [hw]
     hal.timer.delay_ms(5)
     if not sensor.begin()
         hal.uart.write("no answer from the sensor at 0x29\n")
-    let _ = sensor.set_profile(Vl53Profile.Vl53Default)
+    sensor.set_profile(Vl53Profile.Vl53Default)
     while true
         if sensor.range_start() < 0
             hal.uart.write("no answer\n")

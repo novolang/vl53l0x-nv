@@ -1,6 +1,6 @@
 [package]
 name        = "vl53l0x-nv"
-version     = "0.2.0"
+version     = "0.2.1"
 description = "A driver for ST's VL53L0X time-of-flight ranging sensor on an I2C bus: the initialisation sequence with its tuning table and reference calibration, the timing budget, the signal-rate limit and the VCSEL pulse periods, single and continuous ranging, the range in millimetres with ST's range status, and the long-range, high-accuracy and high-speed profiles, as devices-nv's Rangefinder and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"

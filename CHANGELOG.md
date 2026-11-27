@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-11-27
+
+The README example and `examples/range_reader.nv` call `sensor.set_profile` without a binding.  No signature of the package changed.
+
 ## 0.2.0 — 2026-11-24
 
 The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Vl53l0xPort` is smaller by them.  The release depends on devices-nv 0.4.1.
